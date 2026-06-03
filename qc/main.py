@@ -26,8 +26,8 @@ flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task3-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 
-flags.DEFINE_integer('offline_steps', 50000, 'Number of offline steps.')
-flags.DEFINE_integer('online_steps', 50000, 'Number of online steps.')
+flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
+flags.DEFINE_integer('online_steps', 1000000, 'Number of online steps.')
 flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 5000, 'Evaluation interval.')
@@ -90,41 +90,49 @@ def main(_):
     agent = agents[config['agent_name']].create(FLAGS.seed, example_batch['observations'], example_batch['actions'], config)
 
     if FLAGS.use_discriminator:
-        from models.discriminator import SuccessDiscriminator
-        disc_model = SuccessDiscriminator()
+        from models.discriminator import TrajectoryDiscriminator
+        disc_model = TrajectoryDiscriminator()
         disc_rng = jax.random.PRNGKey(FLAGS.seed + 999)
-        disc_params = disc_model.init(disc_rng, example_batch['observations'][None], example_batch['actions'][None])['params']
+        # Init với trajectory-level input: (obs_0, action_chunk_flat)
+        example_action_chunk = np.zeros((1, example_batch['actions'].shape[-1] * FLAGS.horizon_length))
+        disc_params = disc_model.init(disc_rng, example_batch['observations'][None], example_action_chunk)['params']
         disc_tx = optax.adam(learning_rate=3e-4)
         disc_opt_state = disc_tx.init(disc_params)
 
         @jax.jit
-        def update_discriminator_step(params, opt_state, batch_obs, batch_acts, batch_labels, rng_key):
+        def update_discriminator_step(params, opt_state, batch_obs, batch_acts_chunk, batch_labels, rng_key):
+            """Train discriminator trên trajectory-level: (obs_0, action_chunk_flat)."""
             def disc_loss_fn(p):
-                pred = disc_model.apply({'params': p}, batch_obs, batch_acts, deterministic=False, rngs={'dropout': rng_key})
+                pred = disc_model.apply({'params': p}, batch_obs, batch_acts_chunk, deterministic=False, rngs={'dropout': rng_key})
                 return -jnp.mean(batch_labels * jnp.log(pred + 1e-8) + (1 - batch_labels) * jnp.log(1 - pred + 1e-8))
             grads = jax.grad(disc_loss_fn)(params)
             updates, new_opt_state = disc_tx.update(grads, opt_state)
             return optax.apply_updates(params, updates), new_opt_state
 
-        # --- HÀM TỐI ƯU SIÊU TỐC CHO REWARD BẰNG JAX (THAY CHO VÒNG LẶP FOR) ---
+        # --- TRAJECTORY-LEVEL REWARD: 1 score/chunk, clip + normalize ---
         @jax.jit
-        def compute_gail_batch(params, batch_full_obs, batch_acts, batch_rewards, discount, beta):
+        def compute_gail_batch(params, batch_full_obs, batch_acts, batch_rewards, beta):
             B, H = batch_acts.shape[:2]
-            flat_obs = batch_full_obs.reshape((B * H, -1))
-            flat_acts = batch_acts.reshape((B * H, -1))
+            obs_0 = batch_full_obs[:, 0, :]          # (B, obs_dim) — obs đầu tiên của chunk
+            flat_chunk = batch_acts.reshape((B, -1))  # (B, H*act_dim) — toàn bộ action chunk
             
-            d_probs_flat = disc_model.apply({'params': params}, flat_obs, flat_acts, deterministic=True)
-            r_discs = -jnp.log(1.0 - d_probs_flat + 1e-8).reshape((B, H))
+            # 1 score duy nhất cho mỗi trajectory chunk
+            d_probs = disc_model.apply({'params': params}, obs_0, flat_chunk, deterministic=True)  # (B, 1)
+            r_disc = -jnp.log(1.0 - d_probs + 1e-8)  # (B, 1)
             
-            # Tính lũy kế bằng 1 phép nhân ma trận + jnp.cumsum (cực nhanh)
-            discount_powers = discount ** jnp.arange(H)
-            disc_rewards_cum = jnp.cumsum(r_discs * discount_powers, axis=1)
+            # Clip để ngăn reward bùng nổ khi D → 1
+            r_disc = jnp.clip(r_disc, 0.0, 5.0)
             
-            new_rewards = batch_rewards + beta * disc_rewards_cum
-            return new_rewards, jnp.mean(r_discs)
+            # Normalize về zero-mean để ổn định Q-value
+            r_disc = (r_disc - jnp.mean(r_disc)) / (jnp.std(r_disc) + 1e-8)
+            
+            # Cộng trajectory-level bonus vào cumulative reward tại bước cuối (bước mà critic sử dụng)
+            new_rewards = batch_rewards.at[:, -1].add(beta * r_disc.squeeze(-1))
+            
+            return new_rewards, jnp.mean(d_probs)
         # ----------------------------------------------------------------------
 
-        print("✅ GAIL Discriminator ENABLED (Optimized JIT)")
+        print("✅ Trajectory-level Discriminator ENABLED (Clip + Normalize)")
 
     prefixes = ["eval", "env", "offline_agent", "online_agent"]
     logger = LoggingHelper({prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) for prefix in prefixes}, wandb)
@@ -172,7 +180,7 @@ def main(_):
         if 'success' in info: logger.log({"success": float(info['success'])}, "env", step=log_step)
 
         if done:
-            is_success_label = 1.0 if (float(info.get('success', False)) == 1.0 or np.max([t['rewards'] for t in current_episode]) == 0.0) else 0.0
+            is_success_label = 1.0 if float(info.get('success', False)) == 1.0 else 0.0
             
             for t in current_episode:
                 t['is_success'] = is_success_label
@@ -185,31 +193,37 @@ def main(_):
 
         # Discriminator Update
         if FLAGS.use_discriminator and i >= FLAGS.start_training and i % FLAGS.disc_update_interval == 0:
-            if fail_buffer.size > 128:
-                s_batch, f_batch = success_buffer.sample(128), fail_buffer.sample(128)
-                batch_obs = np.concatenate([s_batch['observations'], f_batch['observations']], axis=0)
-                batch_acts = np.concatenate([s_batch['actions'], f_batch['actions']], axis=0)
+            if fail_buffer.size >= 128 + FLAGS.horizon_length:
+                # Sample sequences thay vì individual transitions
+                s_seq = success_buffer.sample_sequence(128, sequence_length=FLAGS.horizon_length, discount=FLAGS.discount)
+                f_seq = fail_buffer.sample_sequence(128, sequence_length=FLAGS.horizon_length, discount=FLAGS.discount)
+                
+                # Trajectory-level: obs đầu tiên + action chunk flatten
+                batch_obs = np.concatenate([s_seq['observations'], f_seq['observations']], axis=0)  # (256, obs_dim)
+                batch_acts_chunk = np.concatenate([
+                    s_seq['actions'].reshape(128, -1),  # (128, H*act_dim)
+                    f_seq['actions'].reshape(128, -1),  # (128, H*act_dim)
+                ], axis=0)  # (256, H*act_dim)
                 labels = np.concatenate([np.ones((128, 1)), np.zeros((128, 1))], axis=0)
                 
                 online_rng, dropout_key = jax.random.split(online_rng)
-                disc_params, disc_opt_state = update_discriminator_step(disc_params, disc_opt_state, batch_obs, batch_acts, labels, dropout_key)
+                disc_params, disc_opt_state = update_discriminator_step(disc_params, disc_opt_state, batch_obs, batch_acts_chunk, labels, dropout_key)
 
         # Agent Update
         if i >= FLAGS.start_training:
             batch = agent_replay_buffer.sample_sequence(config['batch_size'] * FLAGS.utd_ratio, sequence_length=FLAGS.horizon_length, discount=FLAGS.discount)
             
-            # --- CHẤM ĐIỂM REWARD ĐƯỢC TỐI ƯU SIÊU TỐC ---
+            # --- TRAJECTORY-LEVEL DISCRIMINATOR REWARD ---
             if FLAGS.use_discriminator:
-                new_rewards, r_disc_mean = compute_gail_batch(
+                new_rewards, d_prob_mean = compute_gail_batch(
                     disc_params, 
                     batch['full_observations'], 
                     batch['actions'], 
                     batch['rewards'], 
-                    FLAGS.discount, 
                     FLAGS.disc_beta
                 )
                 batch['rewards'] = np.array(new_rewards)
-                logger.log({"disc/r_disc_mean": float(r_disc_mean)}, "online_agent", step=log_step)
+                logger.log({"disc/d_prob_mean": float(d_prob_mean)}, "online_agent", step=log_step)
             # ---------------------------------------------
 
             batch = jax.tree_util.tree_map(lambda x: x.reshape((FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)

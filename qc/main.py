@@ -109,7 +109,7 @@ def main(_):
             updates, new_opt_state = disc_tx.update(grads, opt_state)
             return optax.apply_updates(params, updates), new_opt_state
 
-        # --- TRAJECTORY-LEVEL REWARD: 1 score/chunk, clip + normalize ---
+        # --- TRAJECTORY-LEVEL REWARD: 1 score/chunk, clip + scale [0,1] ---
         @jax.jit
         def compute_gail_batch(params, batch_full_obs, batch_acts, batch_rewards, beta):
             B, H = batch_acts.shape[:2]
@@ -120,11 +120,8 @@ def main(_):
             d_probs = disc_model.apply({'params': params}, obs_0, flat_chunk, deterministic=True)  # (B, 1)
             r_disc = -jnp.log(1.0 - d_probs + 1e-8)  # (B, 1)
             
-            # Clip để ngăn reward bùng nổ khi D → 1
-            r_disc = jnp.clip(r_disc, 0.0, 5.0)
-            
-            # Normalize về zero-mean để ổn định Q-value
-            r_disc = (r_disc - jnp.mean(r_disc)) / (jnp.std(r_disc) + 1e-8)
+            # Clip [0, 5] rồi scale về [0, 1] — chỉ bonus, không phạt
+            r_disc = jnp.clip(r_disc, 0.0, 5.0) / 5.0
             
             # Cộng trajectory-level bonus vào cumulative reward tại bước cuối (bước mà critic sử dụng)
             new_rewards = batch_rewards.at[:, -1].add(beta * r_disc.squeeze(-1))
@@ -132,7 +129,7 @@ def main(_):
             return new_rewards, jnp.mean(d_probs)
         # ----------------------------------------------------------------------
 
-        print("✅ Trajectory-level Discriminator ENABLED (Clip + Normalize)")
+        print("✅ Trajectory-level Discriminator ENABLED (Clip + Scale [0,1])")
 
     prefixes = ["eval", "env", "offline_agent", "online_agent"]
     logger = LoggingHelper({prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) for prefix in prefixes}, wandb)

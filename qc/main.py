@@ -109,27 +109,27 @@ def main(_):
             updates, new_opt_state = disc_tx.update(grads, opt_state)
             return optax.apply_updates(params, updates), new_opt_state
 
-        # --- TRAJECTORY-LEVEL REWARD: 1 score/chunk, clip + scale [0,1] ---
+        # --- W2 CONSTRAINT FILTERING: Weighting Distillation Loss ---
         @jax.jit
-        def compute_gail_batch(params, batch_full_obs, batch_acts, batch_rewards, beta):
+        def compute_w2_weights(params, batch_full_obs, batch_acts):
             B, H = batch_acts.shape[:2]
-            obs_0 = batch_full_obs[:, 0, :]          # (B, obs_dim) — obs đầu tiên của chunk
-            flat_chunk = batch_acts.reshape((B, -1))  # (B, H*act_dim) — toàn bộ action chunk
+            obs_0 = batch_full_obs[:, 0, :]          # (B, obs_dim)
+            flat_chunk = batch_acts.reshape((B, -1))  # (B, H*act_dim)
             
-            # 1 score duy nhất cho mỗi trajectory chunk
             d_probs = disc_model.apply({'params': params}, obs_0, flat_chunk, deterministic=True)  # (B, 1)
-            r_disc = -jnp.log(1.0 - d_probs + 1e-8)  # (B, 1)
+            scores = d_probs.squeeze(-1)  # (B,)
             
-            # Clip [0, 5] rồi scale về [0, 1] — chỉ bonus, không phạt
-            r_disc = jnp.clip(r_disc, 0.0, 5.0) / 5.0
+            # W2 weight proportional to discriminator confidence [0.1, 1.0]
+            # Giữ chặn dưới 0.1 để không tắt hoàn toàn BC
+            w2_weights = jnp.clip(scores, 0.1, 1.0)
             
-            # Cộng trajectory-level bonus vào cumulative reward tại bước cuối (bước mà critic sử dụng)
-            new_rewards = batch_rewards.at[:, -1].add(beta * r_disc.squeeze(-1))
+            # Normalize để giữ gradient magnitude tương tự như khi không dùng weight
+            w2_weights = w2_weights / (jnp.mean(w2_weights) + 1e-8)
             
-            return new_rewards, jnp.mean(d_probs)
+            return w2_weights, jnp.mean(d_probs)
         # ----------------------------------------------------------------------
 
-        print("✅ Trajectory-level Discriminator ENABLED (Clip + Scale [0,1])")
+        print("✅ Discriminator ENABLED — Filtering W2 Constraint (Actor Loss)")
 
     prefixes = ["eval", "env", "offline_agent", "online_agent"]
     logger = LoggingHelper({prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) for prefix in prefixes}, wandb)
@@ -210,16 +210,14 @@ def main(_):
         if i >= FLAGS.start_training:
             batch = agent_replay_buffer.sample_sequence(config['batch_size'] * FLAGS.utd_ratio, sequence_length=FLAGS.horizon_length, discount=FLAGS.discount)
             
-            # --- TRAJECTORY-LEVEL DISCRIMINATOR REWARD ---
+            # --- W2 CONSTRAINT WEIGHTING ---
             if FLAGS.use_discriminator:
-                new_rewards, d_prob_mean = compute_gail_batch(
+                w2_weights, d_prob_mean = compute_w2_weights(
                     disc_params, 
                     batch['full_observations'], 
-                    batch['actions'], 
-                    batch['rewards'], 
-                    FLAGS.disc_beta
+                    batch['actions']
                 )
-                batch['rewards'] = np.array(new_rewards)
+                batch['w2_weights'] = np.array(w2_weights)
                 logger.log({"disc/d_prob_mean": float(d_prob_mean)}, "online_agent", step=log_step)
             # ---------------------------------------------
 

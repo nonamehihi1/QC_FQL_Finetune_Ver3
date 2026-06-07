@@ -86,12 +86,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             noises = jax.random.normal(noise_rng, (batch_size, action_dim))
             target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
             actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
-            
-            if 'w2_weights' in batch:
-                per_sample_distill = jnp.mean((actor_actions - target_flow_actions) ** 2, axis=-1)
-                distill_loss = jnp.mean(per_sample_distill * batch['w2_weights'])
-            else:
-                distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
+            distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
             
             # Q loss.
             actor_actions = jnp.clip(actor_actions, -1, 1)

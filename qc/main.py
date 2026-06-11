@@ -46,10 +46,16 @@ flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
-# === GAIL FLAGS ===
+# === GAIL FLAGS (v3 — improved) ===
 flags.DEFINE_bool('use_discriminator', True, "Enable GAIL Discriminator")
-flags.DEFINE_float('disc_beta', 0.05, "Weight of discriminator reward")
-flags.DEFINE_integer('disc_update_interval', 5000, "Train discriminator every N steps")
+flags.DEFINE_float('disc_beta', 0.1, "Weight of discriminator reward")
+flags.DEFINE_integer('disc_update_interval', 2000, "Train discriminator every N steps")
+flags.DEFINE_integer('disc_gradient_steps', 20, "Number of disc gradient steps per update")
+flags.DEFINE_float('disc_lr', 1e-4, "Discriminator learning rate")
+flags.DEFINE_float('disc_gp_coeff', 5.0, "Gradient penalty coefficient")
+flags.DEFINE_integer('disc_warmup_steps', 100000, "Beta warm-up steps")
+flags.DEFINE_integer('disc_buffer_tail', 30, "Number of tail steps from episode to add to success/fail buffer")
+flags.DEFINE_integer('disc_min_buffer', 128, "Minimum buffer size before disc training starts")
 
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
@@ -89,49 +95,133 @@ def main(_):
 
     agent = agents[config['agent_name']].create(FLAGS.seed, example_batch['observations'], example_batch['actions'], config)
 
+    # ====================== DISCRIMINATOR SETUP (v3) ======================
     if FLAGS.use_discriminator:
         from models.discriminator import PerStepDiscriminator
         disc_model = PerStepDiscriminator()
         disc_rng = jax.random.PRNGKey(FLAGS.seed + 999)
-        # Init với per-step input: (obs, action)
-        example_action = np.zeros((1, example_batch['actions'].shape[-1]))
-        disc_params = disc_model.init(disc_rng, example_batch['observations'][None], example_action)['params']
-        disc_tx = optax.adam(learning_rate=3e-4)
+        
+        # Init with per-step input: (obs, action)
+        obs_dim = example_batch['observations'].shape[-1]
+        act_dim = example_batch['actions'].shape[-1]
+        example_obs_init = np.zeros((1, obs_dim))
+        example_act_init = np.zeros((1, act_dim))
+        disc_params = disc_model.init(disc_rng, example_obs_init, example_act_init)['params']
+        disc_tx = optax.adam(learning_rate=FLAGS.disc_lr)
         disc_opt_state = disc_tx.init(disc_params)
 
+        # --- Discriminator update with Gradient Penalty + Label Smoothing ---
         @jax.jit
-        def update_discriminator_step(params, opt_state, batch_obs, batch_acts, batch_labels, rng_key):
-            """Train discriminator trên per-step transitions: (obs, action)."""
+        def update_discriminator_step(params, opt_state, expert_obs, expert_acts, 
+                                       policy_obs, policy_acts, rng_key):
+            """Train discriminator with GP + label smoothing.
+            
+            Args:
+                expert_obs, expert_acts: transitions from success buffer (N, dim)
+                policy_obs, policy_acts: transitions from fail buffer (N, dim)
+            """
             def disc_loss_fn(p):
-                pred = disc_model.apply({'params': p}, batch_obs, batch_acts, deterministic=False, rngs={'dropout': rng_key})
-                return -jnp.mean(batch_labels * jnp.log(pred + 1e-8) + (1 - batch_labels) * jnp.log(1 - pred + 1e-8))
-            grads = jax.grad(disc_loss_fn)(params)
+                rng_dropout, rng_gp = jax.random.split(rng_key)
+                
+                # Forward pass — expert (success) and policy (fail)
+                expert_pred = disc_model.apply(
+                    {'params': p}, expert_obs, expert_acts, 
+                    deterministic=False, rngs={'dropout': rng_dropout})  # (N, 1)
+                policy_pred = disc_model.apply(
+                    {'params': p}, policy_obs, policy_acts,
+                    deterministic=False, rngs={'dropout': rng_dropout})  # (N, 1)
+                
+                # BCE with label smoothing (0.9/0.1 instead of 1.0/0.0)
+                # Reduces overconfidence when labels are noisy (whole-episode labeling)
+                expert_loss = -jnp.mean(
+                    0.9 * jnp.log(expert_pred + 1e-8) + 
+                    0.1 * jnp.log(1.0 - expert_pred + 1e-8))
+                policy_loss = -jnp.mean(
+                    0.1 * jnp.log(policy_pred + 1e-8) + 
+                    0.9 * jnp.log(1.0 - policy_pred + 1e-8))
+                bce_loss = (expert_loss + policy_loss) / 2.0
+                
+                # Gradient Penalty (WGAN-GP style) on interpolated samples
+                n = expert_obs.shape[0]
+                alpha = jax.random.uniform(rng_gp, (n, 1))
+                interp_obs = alpha * expert_obs + (1.0 - alpha) * policy_obs
+                interp_acts = alpha * expert_acts + (1.0 - alpha) * policy_acts
+                
+                def gp_forward(obs_in, acts_in):
+                    return disc_model.apply(
+                        {'params': p}, obs_in, acts_in, deterministic=True).sum()
+                
+                grad_obs, grad_acts = jax.grad(gp_forward, argnums=(0, 1))(interp_obs, interp_acts)
+                grad_norm = jnp.sqrt(
+                    jnp.sum(grad_obs ** 2, axis=-1) + 
+                    jnp.sum(grad_acts ** 2, axis=-1) + 1e-8)
+                gp = jnp.mean((grad_norm - 1.0) ** 2)
+                
+                total_loss = bce_loss + FLAGS.disc_gp_coeff * gp
+                
+                # Metrics for logging
+                expert_acc = jnp.mean(expert_pred > 0.5)
+                policy_acc = jnp.mean(policy_pred < 0.5)
+                
+                return total_loss, {
+                    'disc/loss': total_loss,
+                    'disc/bce': bce_loss,
+                    'disc/gp': gp,
+                    'disc/expert_acc': expert_acc,
+                    'disc/policy_acc': policy_acc,
+                    'disc/accuracy': (expert_acc + policy_acc) / 2.0,
+                    'disc/expert_pred_mean': jnp.mean(expert_pred),
+                    'disc/policy_pred_mean': jnp.mean(policy_pred),
+                }
+            
+            (loss, metrics), grads = jax.value_and_grad(disc_loss_fn, has_aux=True)(params)
             updates, new_opt_state = disc_tx.update(grads, opt_state)
-            return optax.apply_updates(params, updates), new_opt_state
+            new_params = optax.apply_updates(params, updates)
+            return new_params, new_opt_state, metrics
 
-        # --- PER-STEP ADVERSARIAL REWARD SHAPING ---
+        # --- Per-step reward shaping with flatten approach (like Cách 1) ---
         discount_powers = jnp.power(FLAGS.discount, jnp.arange(FLAGS.horizon_length))
 
         @jax.jit
         def compute_shaped_rewards(params, batch_obs, batch_acts, batch_rewards, beta):
-            """Shape sequence cumulative rewards step-by-step using per-step discriminator."""
-            # Predict scores for all steps in the sequence
-            d_probs = disc_model.apply({'params': params}, batch_obs, batch_acts, deterministic=True)  # (B, H, 1)
-            scores = d_probs.squeeze(-1)  # (B, H)
+            """Shape cumulative rewards using per-step discriminator (flatten approach).
             
-            # Compute step-by-step discriminator reward
+            Flatten (B, H, dim) → (B*H, dim), evaluate each step independently,
+            then reshape back and integrate into cumulative reward structure.
+            
+            Args:
+                batch_obs: (B, H, obs_dim) — sequence observations
+                batch_acts: (B, H, act_dim) — sequence actions
+                batch_rewards: (B, H) — cumulative discounted env rewards from sample_sequence()
+                beta: disc reward weight (warmed up)
+            """
+            B, H = batch_acts.shape[0], batch_acts.shape[1]
+            
+            # Flatten (B, H, dim) → (B*H, dim) for per-step evaluation
+            flat_obs = batch_obs.reshape(B * H, -1)
+            flat_acts = batch_acts.reshape(B * H, -1)
+            
+            # Per-step discriminator prediction
+            d_probs = disc_model.apply(
+                {'params': params}, flat_obs, flat_acts, deterministic=True)  # (B*H, 1)
+            scores = d_probs.reshape(B, H)  # (B, H)
+            
+            # GAIL reward: r_disc = -log(1 - D(s,a))
             r_disc = -jnp.log(1.0 - scores + 1e-8)
-            r_disc = jnp.clip(r_disc, 0.0, 5.0) / 5.0  # (B, H)
+            r_disc = jnp.clip(r_disc, 0.0, 5.0) / 5.0  # [0, 1] normalized
             
-            # Cumulative discounted discriminator reward
+            # Integrate into cumulative reward structure:
+            # batch_rewards[:,i] = Σ_{t=0}^{i} γ^t r_env_t (already cumulative)
+            # shaped[:,i] = Σ_{t=0}^{i} γ^t (r_env_t + β*r_disc_t)
+            #             = batch_rewards[:,i] + β * Σ_{t=0}^{i} γ^t r_disc_t
             discounted_r_disc = r_disc * discount_powers[None, :]  # (B, H)
-            cum_r_disc = jnp.cumsum(discounted_r_disc, axis=1)     # (B, H)
+            cum_disc = jnp.cumsum(discounted_r_disc, axis=1)  # (B, H)
             
-            # Shape the environment cumulative rewards
-            shaped_rewards = batch_rewards + beta * cum_r_disc
-            return shaped_rewards, jnp.mean(scores)
+            shaped_rewards = batch_rewards + beta * cum_disc
+            
+            return shaped_rewards, jnp.mean(scores), jnp.mean(r_disc), jnp.max(r_disc)
 
-        print("✅ Per-step Discriminator ENABLED — Adversarial Reward Shaping")
+        print("✅ Per-step Discriminator v3 ENABLED — Flatten + GP + Label Smoothing + Adaptive β")
 
     prefixes = ["eval", "env", "offline_agent", "online_agent"]
     logger = LoggingHelper({prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) for prefix in prefixes}, wandb)
@@ -160,6 +250,7 @@ def main(_):
     ob, _ = env.reset()
     action_queue = []
     current_episode = []
+    disc_metrics = {}  # Store latest disc training metrics
 
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1), desc="Online"):
         log_step += 1
@@ -181,47 +272,95 @@ def main(_):
         if done:
             is_success_label = 1.0 if float(info.get('success', False)) == 1.0 else 0.0
             
+            # Add ALL transitions to agent replay buffer (as before)
             for t in current_episode:
                 t['is_success'] = is_success_label
                 agent_replay_buffer.add_transition(t)
-                if is_success_label == 1.0: success_buffer.add_transition(t)
-                else: fail_buffer.add_transition(t)
+            
+            # ---- IMPROVED BUFFER MANAGEMENT (v3) ----
+            # Only add tail steps to success/fail buffer to reduce label noise.
+            # In success episodes: last N steps are closest to the goal (highest quality).
+            # In fail episodes: last N steps show where the agent went wrong.
+            tail_steps = min(FLAGS.disc_buffer_tail, len(current_episode))
+            tail_transitions = current_episode[-tail_steps:]
+            
+            if is_success_label == 1.0:
+                for t in tail_transitions:
+                    success_buffer.add_transition(t)
+            else:
+                for t in tail_transitions:
+                    fail_buffer.add_transition(t)
             
             current_episode, action_queue, (ob, _) = [], [], env.reset()
         else: ob = next_ob
 
-        # Discriminator Update
-        if FLAGS.use_discriminator and i >= FLAGS.start_training and i % FLAGS.disc_update_interval == 0:
-            if success_buffer.size >= 128 and fail_buffer.size >= 128:
-                for _ in range(10):  # Train discriminator properly with multiple steps
-                    s_batch = success_buffer.sample(128)
-                    f_batch = fail_buffer.sample(128)
-                    
-                    batch_obs = np.concatenate([s_batch['observations'], f_batch['observations']], axis=0)  # (256, obs_dim)
-                    batch_acts = np.concatenate([s_batch['actions'], f_batch['actions']], axis=0)  # (256, action_dim)
-                    labels = np.concatenate([np.ones((128, 1)), np.zeros((128, 1))], axis=0)
-                    
-                    online_rng, dropout_key = jax.random.split(online_rng)
-                    disc_params, disc_opt_state = update_discriminator_step(disc_params, disc_opt_state, batch_obs, batch_acts, labels, dropout_key)
+        # ====================== DISCRIMINATOR UPDATE (v3) ======================
+        disc_ready = (FLAGS.use_discriminator and 
+                      i >= FLAGS.start_training and 
+                      i % FLAGS.disc_update_interval == 0 and
+                      success_buffer.size >= FLAGS.disc_min_buffer and 
+                      fail_buffer.size >= FLAGS.disc_min_buffer)
+        
+        if disc_ready:
+            batch_size_half = 128
+            for disc_step in range(FLAGS.disc_gradient_steps):
+                s_batch = success_buffer.sample(batch_size_half)
+                f_batch = fail_buffer.sample(batch_size_half)
+                
+                online_rng, dropout_key = jax.random.split(online_rng)
+                disc_params, disc_opt_state, disc_metrics = update_discriminator_step(
+                    disc_params, disc_opt_state,
+                    expert_obs=s_batch['observations'],
+                    expert_acts=s_batch['actions'],
+                    policy_obs=f_batch['observations'],
+                    policy_acts=f_batch['actions'],
+                    rng_key=dropout_key,
+                )
+            
+            # Log disc training metrics (from last gradient step)
+            disc_log = {k: float(v) for k, v in disc_metrics.items()}
+            disc_log['disc/success_buffer_size'] = float(success_buffer.size)
+            disc_log['disc/fail_buffer_size'] = float(fail_buffer.size)
+            logger.log(disc_log, "online_agent", step=log_step)
 
-        # Agent Update
+        # ====================== AGENT UPDATE ======================
         if i >= FLAGS.start_training:
             batch = agent_replay_buffer.sample_sequence(config['batch_size'] * FLAGS.utd_ratio, sequence_length=FLAGS.horizon_length, discount=FLAGS.discount)
             
-            # --- PER-STEP ADVERSARIAL REWARD SHAPING ---
+            # --- PER-STEP ADVERSARIAL REWARD SHAPING (v3) ---
             if FLAGS.use_discriminator:
-                if success_buffer.size >= 128 and fail_buffer.size >= 128:
-                    shaped_rewards, d_prob_mean = compute_shaped_rewards(
+                can_shape = (success_buffer.size >= FLAGS.disc_min_buffer and 
+                             fail_buffer.size >= FLAGS.disc_min_buffer)
+                if can_shape:
+                    # Adaptive β with warm-up: ramp from 0 → disc_beta over warmup_steps
+                    steps_since_start = max(0, i - FLAGS.start_training)
+                    warmup_ratio = min(1.0, steps_since_start / max(1, FLAGS.disc_warmup_steps))
+                    current_beta = FLAGS.disc_beta * warmup_ratio
+                    
+                    shaped_rewards, d_prob_mean, r_disc_mean, r_disc_max = compute_shaped_rewards(
                         disc_params, 
                         batch['full_observations'], 
                         batch['actions'], 
                         batch['rewards'],
-                        FLAGS.disc_beta
+                        current_beta
                     )
                     batch['rewards'] = np.array(shaped_rewards)
-                    logger.log({"disc/d_prob_mean": float(d_prob_mean)}, "online_agent", step=log_step)
+                    
+                    if i % FLAGS.log_interval == 0:
+                        logger.log({
+                            "disc/d_prob_mean": float(d_prob_mean),
+                            "disc/r_disc_mean": float(r_disc_mean),
+                            "disc/r_disc_max": float(r_disc_max),
+                            "disc/beta": float(current_beta),
+                            "disc/warmup_ratio": float(warmup_ratio),
+                        }, "online_agent", step=log_step)
                 else:
-                    logger.log({"disc/d_prob_mean": 0.5}, "online_agent", step=log_step)
+                    if i % FLAGS.log_interval == 0:
+                        logger.log({
+                            "disc/d_prob_mean": 0.5,
+                            "disc/r_disc_mean": 0.0,
+                            "disc/beta": 0.0,
+                        }, "online_agent", step=log_step)
             # ---------------------------------------------
 
             batch = jax.tree_util.tree_map(lambda x: x.reshape((FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)

@@ -186,14 +186,13 @@ def main(_):
         def compute_shaped_rewards(params, batch_obs, batch_acts, batch_rewards, beta):
             """Shape cumulative rewards using per-step discriminator (flatten approach).
             
-            Flatten (B, H, dim) → (B*H, dim), evaluate each step independently,
-            then reshape back and integrate into cumulative reward structure.
+            Uses CENTERED logit reward: log(D/(1-D)) instead of -log(1-D).
+            - When D ≈ 0.5 (uncertain) → r_disc ≈ 0 (no bias)
+            - When D > 0.5 (expert-like) → r_disc > 0 (encourage)
+            - When D < 0.5 (policy-like) → r_disc < 0 (discourage)
             
-            Args:
-                batch_obs: (B, H, obs_dim) — sequence observations
-                batch_acts: (B, H, act_dim) — sequence actions
-                batch_rewards: (B, H) — cumulative discounted env rewards from sample_sequence()
-                beta: disc reward weight (warmed up)
+            This is critical because env reward ∈ [-3, 0]. An always-positive
+            disc reward would add positive bias that corrupts Q-values.
             """
             B, H = batch_acts.shape[0], batch_acts.shape[1]
             
@@ -206,14 +205,14 @@ def main(_):
                 {'params': params}, flat_obs, flat_acts, deterministic=True)  # (B*H, 1)
             scores = d_probs.reshape(B, H)  # (B, H)
             
-            # GAIL reward: r_disc = -log(1 - D(s,a))
-            r_disc = -jnp.log(1.0 - scores + 1e-8)
-            r_disc = jnp.clip(r_disc, 0.0, 5.0) / 5.0  # [0, 1] normalized
+            # Centered logit reward: log(D) - log(1-D) ∈ (-∞, +∞), 0 when D=0.5
+            r_disc_raw = jnp.log(scores + 1e-8) - jnp.log(1.0 - scores + 1e-8)
+            # Clip to [-3, 3] then normalize to [-1, 1] — matches env reward scale
+            r_disc = jnp.clip(r_disc_raw, -3.0, 3.0) / 3.0
             
             # Integrate into cumulative reward structure:
             # batch_rewards[:,i] = Σ_{t=0}^{i} γ^t r_env_t (already cumulative)
-            # shaped[:,i] = Σ_{t=0}^{i} γ^t (r_env_t + β*r_disc_t)
-            #             = batch_rewards[:,i] + β * Σ_{t=0}^{i} γ^t r_disc_t
+            # shaped[:,i] = batch_rewards[:,i] + β * Σ_{t=0}^{i} γ^t r_disc_t
             discounted_r_disc = r_disc * discount_powers[None, :]  # (B, H)
             cum_disc = jnp.cumsum(discounted_r_disc, axis=1)  # (B, H)
             

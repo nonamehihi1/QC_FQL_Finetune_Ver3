@@ -1,4 +1,5 @@
 import glob, tqdm, wandb, os, json, random, time, jax
+from collections import deque
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -250,6 +251,7 @@ def main(_):
     action_queue = []
     current_episode = []
     disc_metrics = {}  # Store latest disc training metrics
+    recent_returns = deque(maxlen=200)  # Track recent episode returns for ranking
 
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1), desc="Online"):
         log_step += 1
@@ -270,25 +272,49 @@ def main(_):
 
         if done:
             is_success_label = 1.0 if float(info.get('success', False)) == 1.0 else 0.0
+            episode_return = sum(t['rewards'] for t in current_episode)
+            recent_returns.append(episode_return)
             
             # Add ALL transitions to agent replay buffer (as before)
             for t in current_episode:
                 t['is_success'] = is_success_label
                 agent_replay_buffer.add_transition(t)
             
-            # ---- IMPROVED BUFFER MANAGEMENT (v3) ----
-            # Only add tail steps to success/fail buffer to reduce label noise.
-            # In success episodes: last N steps are closest to the goal (highest quality).
-            # In fail episodes: last N steps show where the agent went wrong.
+            # ---- RETURN-RANKED BUFFER MANAGEMENT (v5) ----
+            # CRITICAL FIX for cold-start problem:
+            # Instead of requiring actual task success (binary), use episode return
+            # ranking to fill success/fail buffers. This ensures discriminator
+            # ALWAYS has training data, even when no episode has succeeded yet.
+            #
+            # - Above median return → "better" → success buffer
+            # - Below median return → "worse" → fail buffer  
+            # - Even with all episodes failing, some are BETTER failures (-1 vs -3)
             tail_steps = min(FLAGS.disc_buffer_tail, len(current_episode))
             tail_transitions = current_episode[-tail_steps:]
             
-            if is_success_label == 1.0:
+            if len(recent_returns) >= 20:
+                # Enough history: use median return as adaptive threshold
+                median_return = float(np.median(list(recent_returns)))
+                is_better = (episode_return >= median_return)
+            else:
+                # Too few episodes: fall back to binary success label
+                is_better = (is_success_label == 1.0)
+            
+            if is_better:
                 for t in tail_transitions:
                     success_buffer.add_transition(t)
             else:
                 for t in tail_transitions:
                     fail_buffer.add_transition(t)
+            
+            # Log episode stats
+            if i % FLAGS.log_interval == 0:
+                logger.log({
+                    "disc/episode_return": episode_return,
+                    "disc/return_threshold": float(np.median(list(recent_returns))) if len(recent_returns) >= 20 else -999.0,
+                    "disc/success_buffer_size": float(success_buffer.size),
+                    "disc/fail_buffer_size": float(fail_buffer.size),
+                }, "online_agent", step=log_step)
             
             current_episode, action_queue, (ob, _) = [], [], env.reset()
         else: ob = next_ob

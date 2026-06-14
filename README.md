@@ -1,108 +1,103 @@
-# QC-FQL + GAIL Discriminator — Version History
+# QC-FQL + Discriminator — Version History
 
-## Phiên bản hiện tại: v5 (Return-Ranked Buffers)
+## Phiên bản hiện tại: v6 (Priority Sampling)
 
 ---
 
-## v5 — Return-Ranked Buffers (2026-06-15)
+## v6 — Priority Sampling (2026-06-15) ⭐ CURRENT
 
-### Vấn đề v4 giải quyết chưa xong
-Cùng code, cùng tham số nhưng **seed khác nhau cho kết quả chênh lệch lớn**: 1 seed lên 0.5, 1 seed dính 0. 
-**Nguyên nhân**: Cold-start — discriminator cần `success_buffer >= 128` mới bắt đầu train, nhưng seed xấu không bao giờ thành công → disc không bao giờ được train → vòng lặp chết.
+### Thay đổi lớn: Chuyển hoàn toàn từ Cách 1 → Cách 2
 
-### Fix
-Thay binary success/fail bằng **return-ranked**:
-- Track 200 episode returns gần nhất
-- Tính **median return** làm ngưỡng
-- Episode return ≥ median → success buffer ("tốt hơn")
-- Episode return < median → fail buffer ("xấu hơn")
-- **Disc luôn có data để train**, kể cả khi chưa episode nào succeed
+**Cách 1 (v3-v5): "Ông gia sư nhiễu sự" — Reward Shaping**
+```
+Disc cho kẹo (cộng disc reward) → Agent hack kẹo thay vì giải toán
+→ Q-values bị "ngộ độc kẹo ảo" → Kết quả dao động, không ổn định
+```
+
+**Cách 2 (v6): "Ông gia sư tuyển chọn" — Priority Sampling** ✅
+```
+1. Agent làm 1024 bài nháp (sample oversized batch)
+2. Disc xếp hạng 1024 bài từ cao→thấp (score sequences)
+3. Chọn TOP 256 bài sáng sủa nhất (filter top-K)
+4. Agent phân tích rút kinh nghiệm 256 bài đó (train on filtered batch)
+5. Reward 100% từ environment — KHÔNG bị disc sửa đổi!
+```
+
+### So sánh kỹ thuật
+
+| | Cách 1 (v3-v5) | Cách 2 (v6) |
+|---|---|---|
+| Disc làm gì? | **Cộng/trừ** reward | **Lọc** mẫu tốt nhất |
+| Agent thấy reward gì? | env + disc (bị biến đổi) | **env gốc 100%** |
+| Q-values? | Bị corrupt | **Sạch** |
+| Rủi ro hack? | Agent hack disc reward | **Không** — disc không ảnh hưởng reward |
 
 ### Files thay đổi
-- `qc/main.py` — Thêm `from collections import deque`, đổi logic buffer management
+- `qc/main.py`:
+  - Xóa `compute_shaped_rewards()` (reward shaping)
+  - Thêm `score_sequences()` (scoring only)
+  - Agent update: oversample → filter → train trên reward gốc
+  - Xóa flags: `disc_beta`, `disc_warmup_steps`
+  - Thêm flag: `disc_oversample_ratio` (default=4, sample 4x lọc top 25%)
 
 ### Chạy thử nghiệm
 ```bash
 MUJOCO_GL=egl python main.py \
-  --run_group=Task4_GAIL_v5 \
+  --run_group=Task4_GAIL_v6 \
   --env_name=cube-triple-play-singletask-task4-v0 \
   --sparse=False \
   --horizon_length=5 \
   --use_discriminator=True \
-  --disc_beta=0.2 \
+  --disc_oversample_ratio=4 \
   --offline_steps=1000000 \
   --online_steps=1000000 \
   --eval_interval=100000 \
   --disc_update_interval=2000 \
   --disc_gradient_steps=20 \
-  --disc_warmup_steps=100000 \
-  --disc_buffer_tail=30 \
   --disc_gp_coeff=5.0 \
   --disc_lr=1e-4
 ```
 
 ---
 
-## v4 — Centered Logit Reward (2026-06-11)
+## Lịch sử phiên bản cũ
 
-### Vấn đề v3
-Chạy v3 → eval/success = 0 hoàn toàn. 2 nguyên nhân:
+### v5 — Return-Ranked Buffers (2026-06-15)
+- Fix cold-start: thay binary success/fail bằng median return ranking
+- Vẫn dùng Cách 1 (reward shaping) → vẫn bị vấn đề "kẹo ảo"
 
-1. **LayerNorm trong Discriminator** phá Gradient Penalty — gradients qua LayerNorm trên interpolated samples bị unstable
-2. **Disc reward `-log(1-D)` luôn dương** [0,∞) nhưng env reward ∈ [-3, 0]. Khi disc chưa hội tụ (D≈0.5), thêm constant positive bias → Q-values sai
+### v4 — Centered Logit Reward (2026-06-11)
+- Bỏ LayerNorm (phá GP), đổi reward thành centered logit
+- Kết quả: 0-0.5 (seed-dependent), 1 seed vẫn dính 0
 
-### Fix
-1. **Bỏ LayerNorm** — giữ `Dense → LeakyReLU → Dropout` (chuẩn WGAN-GP)
-2. **Centered logit reward**: `log(D/(1-D))` thay vì `-log(1-D)`
-   - D ≈ 0.5 → reward ≈ 0 (không bias!)
-   - D > 0.5 (expert-like) → reward > 0
-   - D < 0.5 (policy-like) → reward < 0
-
-### Files thay đổi
-- `qc/models/discriminator.py` — Bỏ LayerNorm
-- `qc/main.py` — Đổi reward formula
+### v3 — GAIL Discriminator Overhaul (2026-06-11)
+- Disc lớn hơn (512,512,256), GP, Label Smoothing, Adaptive β
+- Kết quả: success = 0 (LayerNorm + positive bias)
 
 ---
 
-## v3 — GAIL Discriminator Overhaul (2026-06-11)
-
-### Thay đổi so với v2 (code gốc)
-1. **Discriminator lớn hơn**: (256,256) → (512,512,256) + LeakyReLU
-2. **Flatten approach**: (B,H) → (B*H) giống Cách 1 cho per-step evaluation
-3. **Gradient Penalty** (λ=5.0) trên interpolated samples
-4. **Label Smoothing** (0.9/0.1) giảm overconfidence từ label noise
-5. **Adaptive β warm-up**: 0 → disc_beta qua 100k steps
-6. **Buffer tail**: Chỉ lấy 30 bước cuối episode
-7. **Disc hyperparams**: interval=2000, lr=1e-4, grad_steps=20
-
-### Files thay đổi
-- `qc/models/discriminator.py` — Kiến trúc mới
-- `qc/main.py` — Toàn bộ GAIL logic
-
----
-
-## Flags mới (v3+)
+## Flags hiện tại (v6)
 
 | Flag | Default | Mô tả |
 |------|---------|-------|
-| `--disc_beta` | 0.1 | Trọng số disc reward |
+| `--use_discriminator` | True | Bật/tắt discriminator |
+| `--disc_oversample_ratio` | 4 | Sample Nx, giữ top 1/N |
 | `--disc_update_interval` | 2000 | Update disc mỗi N steps |
-| `--disc_gradient_steps` | 20 | Số gradient steps mỗi lần update disc |
-| `--disc_lr` | 1e-4 | Learning rate của disc |
+| `--disc_gradient_steps` | 20 | Gradient steps mỗi lần update |
+| `--disc_lr` | 1e-4 | Learning rate disc |
 | `--disc_gp_coeff` | 5.0 | Gradient Penalty coefficient |
-| `--disc_warmup_steps` | 100000 | β warm-up period |
-| `--disc_buffer_tail` | 30 | Số bước cuối episode cho disc buffer |
-| `--disc_min_buffer` | 128 | Tối thiểu buffer size trước khi disc train |
+| `--disc_buffer_tail` | 30 | Bước cuối episode cho disc buffer |
+| `--disc_min_buffer` | 128 | Min buffer size trước khi disc train |
 
 ---
 
 ## Kết quả thực nghiệm (Cube_TripleTask_Task4)
 
-| Phương pháp | Success Rate | Ổn định? | Ghi chú |
-|---|---|---|---|
-| Base (không Disc) | ~0.6 max | ✅ | Giới hạn exploration |
-| Cách 1 (per-action, β=0.1/0.2) | Max 0.7-0.8 | ❌ Dao động | Label noise, Dis overfit |
-| Cách 2 (cumsum, code gốc) | 0.1-0.4 | ❌ | Reward scale sai |
-| v3 | 0 | ❌ | LayerNorm + positive bias |
-| v4 | 0-0.5 (seed-dependent) | ❌ | Cold-start problem |
-| v5 | ⏳ Đang chạy | — | Return-ranked fix |
+| Phương pháp | Cách | Success Rate | Ổn định? | Ghi chú |
+|---|---|---|---|---|
+| Base (không Disc) | — | ~0.6 max | ✅ | Giới hạn exploration |
+| Cách 1 gốc (β=0.1/0.2) | Reward Shaping | Max 0.7-0.8 | ❌ | Label noise, dao động |
+| v3 | Reward Shaping | 0 | ❌ | LayerNorm + positive bias |
+| v4 | Reward Shaping | 0-0.5 | ❌ | Cold-start problem |
+| v5 | Reward Shaping | — | — | Return-ranked, vẫn reward shaping |
+| **v6** | **Priority Sampling** | ⏳ | — | **Không sửa reward, chỉ lọc mẫu** |

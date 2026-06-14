@@ -47,16 +47,15 @@ flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
 flags.DEFINE_integer('horizon_length', 5, 'action chunking length.')
 flags.DEFINE_bool('sparse', False, "make the task sparse reward")
 
-# === GAIL FLAGS (v3 — improved) ===
-flags.DEFINE_bool('use_discriminator', True, "Enable GAIL Discriminator")
-flags.DEFINE_float('disc_beta', 0.1, "Weight of discriminator reward")
+# === DISCRIMINATOR FLAGS (v6 — Priority Sampling) ===
+flags.DEFINE_bool('use_discriminator', True, "Enable Discriminator for priority sampling")
 flags.DEFINE_integer('disc_update_interval', 2000, "Train discriminator every N steps")
 flags.DEFINE_integer('disc_gradient_steps', 20, "Number of disc gradient steps per update")
 flags.DEFINE_float('disc_lr', 1e-4, "Discriminator learning rate")
 flags.DEFINE_float('disc_gp_coeff', 5.0, "Gradient penalty coefficient")
-flags.DEFINE_integer('disc_warmup_steps', 100000, "Beta warm-up steps")
 flags.DEFINE_integer('disc_buffer_tail', 30, "Number of tail steps from episode to add to success/fail buffer")
 flags.DEFINE_integer('disc_min_buffer', 128, "Minimum buffer size before disc training starts")
+flags.DEFINE_integer('disc_oversample_ratio', 4, "Sample N times more, keep top 1/N (priority sampling)")
 
 class LoggingHelper:
     def __init__(self, csv_loggers, wandb_logger):
@@ -180,48 +179,28 @@ def main(_):
             new_params = optax.apply_updates(params, updates)
             return new_params, new_opt_state, metrics
 
-        # --- Per-step reward shaping with flatten approach (like Cách 1) ---
-        discount_powers = jnp.power(FLAGS.discount, jnp.arange(FLAGS.horizon_length))
-
+        # --- Priority Sampling: score sequences, NO reward modification ---
         @jax.jit
-        def compute_shaped_rewards(params, batch_obs, batch_acts, batch_rewards, beta):
-            """Shape cumulative rewards using per-step discriminator (flatten approach).
+        def score_sequences(params, batch_obs, batch_acts):
+            """Score sequences using discriminator for priority sampling.
             
-            Uses CENTERED logit reward: log(D/(1-D)) instead of -log(1-D).
-            - When D ≈ 0.5 (uncertain) → r_disc ≈ 0 (no bias)
-            - When D > 0.5 (expert-like) → r_disc > 0 (encourage)
-            - When D < 0.5 (policy-like) → r_disc < 0 (discourage)
+            Flatten (B, H, dim) → (B*H, dim), evaluate each step independently,
+            then average per-sequence to get a quality score.
             
-            This is critical because env reward ∈ [-3, 0]. An always-positive
-            disc reward would add positive bias that corrupts Q-values.
+            Returns per-sequence scores (B,) — higher = more expert-like.
+            Does NOT modify rewards in any way.
             """
             B, H = batch_acts.shape[0], batch_acts.shape[1]
-            
-            # Flatten (B, H, dim) → (B*H, dim) for per-step evaluation
             flat_obs = batch_obs.reshape(B * H, -1)
             flat_acts = batch_acts.reshape(B * H, -1)
             
-            # Per-step discriminator prediction
             d_probs = disc_model.apply(
                 {'params': params}, flat_obs, flat_acts, deterministic=True)  # (B*H, 1)
-            scores = d_probs.reshape(B, H)  # (B, H)
-            
-            # Centered logit reward: log(D) - log(1-D) ∈ (-∞, +∞), 0 when D=0.5
-            r_disc_raw = jnp.log(scores + 1e-8) - jnp.log(1.0 - scores + 1e-8)
-            # Clip to [-3, 3] then normalize to [-1, 1] — matches env reward scale
-            r_disc = jnp.clip(r_disc_raw, -3.0, 3.0) / 3.0
-            
-            # Integrate into cumulative reward structure:
-            # batch_rewards[:,i] = Σ_{t=0}^{i} γ^t r_env_t (already cumulative)
-            # shaped[:,i] = batch_rewards[:,i] + β * Σ_{t=0}^{i} γ^t r_disc_t
-            discounted_r_disc = r_disc * discount_powers[None, :]  # (B, H)
-            cum_disc = jnp.cumsum(discounted_r_disc, axis=1)  # (B, H)
-            
-            shaped_rewards = batch_rewards + beta * cum_disc
-            
-            return shaped_rewards, jnp.mean(scores), jnp.mean(r_disc), jnp.max(r_disc)
+            # Average disc score per sequence
+            seq_scores = d_probs.reshape(B, H).mean(axis=1).squeeze(-1)  # (B,)
+            return seq_scores
 
-        print("✅ Per-step Discriminator v3 ENABLED — Flatten + GP + Label Smoothing + Adaptive β")
+        print("✅ Discriminator v6 ENABLED — Priority Sampling (NO reward shaping)")
 
     prefixes = ["eval", "env", "offline_agent", "online_agent"]
     logger = LoggingHelper({prefix: CsvLogger(os.path.join(FLAGS.save_dir, f"{prefix}.csv")) for prefix in prefixes}, wandb)
@@ -348,46 +327,45 @@ def main(_):
             disc_log['disc/fail_buffer_size'] = float(fail_buffer.size)
             logger.log(disc_log, "online_agent", step=log_step)
 
-        # ====================== AGENT UPDATE ======================
+        # ====================== AGENT UPDATE (v6 — Priority Sampling) ======================
         if i >= FLAGS.start_training:
-            batch = agent_replay_buffer.sample_sequence(config['batch_size'] * FLAGS.utd_ratio, sequence_length=FLAGS.horizon_length, discount=FLAGS.discount)
+            target_batch_size = config['batch_size'] * FLAGS.utd_ratio
             
-            # --- PER-STEP ADVERSARIAL REWARD SHAPING (v3) ---
-            if FLAGS.use_discriminator:
-                can_shape = (success_buffer.size >= FLAGS.disc_min_buffer and 
-                             fail_buffer.size >= FLAGS.disc_min_buffer)
-                if can_shape:
-                    # Adaptive β with warm-up: ramp from 0 → disc_beta over warmup_steps
-                    steps_since_start = max(0, i - FLAGS.start_training)
-                    warmup_ratio = min(1.0, steps_since_start / max(1, FLAGS.disc_warmup_steps))
-                    current_beta = FLAGS.disc_beta * warmup_ratio
-                    
-                    shaped_rewards, d_prob_mean, r_disc_mean, r_disc_max = compute_shaped_rewards(
-                        disc_params, 
-                        batch['full_observations'], 
-                        batch['actions'], 
-                        batch['rewards'],
-                        current_beta
-                    )
-                    batch['rewards'] = np.array(shaped_rewards)
-                    
-                    if i % FLAGS.log_interval == 0:
-                        logger.log({
-                            "disc/d_prob_mean": float(d_prob_mean),
-                            "disc/r_disc_mean": float(r_disc_mean),
-                            "disc/r_disc_max": float(r_disc_max),
-                            "disc/beta": float(current_beta),
-                            "disc/warmup_ratio": float(warmup_ratio),
-                        }, "online_agent", step=log_step)
-                else:
-                    if i % FLAGS.log_interval == 0:
-                        logger.log({
-                            "disc/d_prob_mean": 0.5,
-                            "disc/r_disc_mean": 0.0,
-                            "disc/beta": 0.0,
-                        }, "online_agent", step=log_step)
-            # ---------------------------------------------
-
+            # --- PRIORITY SAMPLING: Disc chỉ LỌC mẫu, KHÔNG sửa reward ---
+            can_filter = (FLAGS.use_discriminator and 
+                          success_buffer.size >= FLAGS.disc_min_buffer and 
+                          fail_buffer.size >= FLAGS.disc_min_buffer)
+            
+            if can_filter:
+                # 1) Sample OVERSIZED batch (e.g., 4x more than needed)
+                oversample_size = target_batch_size * FLAGS.disc_oversample_ratio
+                large_batch = agent_replay_buffer.sample_sequence(
+                    oversample_size, sequence_length=FLAGS.horizon_length, discount=FLAGS.discount)
+                
+                # 2) Score each sequence with discriminator
+                seq_scores = score_sequences(
+                    disc_params, large_batch['full_observations'], large_batch['actions'])
+                scores_np = np.array(seq_scores)  # (oversample_size,)
+                
+                # 3) Select TOP-K sequences (highest disc score = most expert-like)
+                top_indices = np.argsort(scores_np)[-target_batch_size:]  # top 1/N
+                
+                # 4) Filter batch — keep ONLY top-K, with ORIGINAL rewards (no shaping!)
+                batch = {k: v[top_indices] for k, v in large_batch.items()}
+                
+                if i % FLAGS.log_interval == 0:
+                    logger.log({
+                        "disc/filter_score_mean": float(np.mean(scores_np)),
+                        "disc/filter_score_top_mean": float(np.mean(scores_np[top_indices])),
+                        "disc/filter_score_bottom_mean": float(np.mean(np.sort(scores_np)[:target_batch_size])),
+                        "disc/filter_threshold": float(np.sort(scores_np)[-target_batch_size]),
+                    }, "online_agent", step=log_step)
+            else:
+                # Disc not ready: sample normally (same as Base)
+                batch = agent_replay_buffer.sample_sequence(
+                    target_batch_size, sequence_length=FLAGS.horizon_length, discount=FLAGS.discount)
+            
+            # Train agent with ORIGINAL environment rewards (NO disc reward added!)
             batch = jax.tree_util.tree_map(lambda x: x.reshape((FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
             agent, update_info = agent.batch_update(batch)
             if i % FLAGS.log_interval == 0: logger.log(update_info, "online_agent", step=log_step)

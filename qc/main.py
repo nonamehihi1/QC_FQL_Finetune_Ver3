@@ -197,7 +197,7 @@ def main(_):
             d_probs = disc_model.apply(
                 {'params': params}, flat_obs, flat_acts, deterministic=True)  # (B*H, 1)
             # Average disc score per sequence
-            seq_scores = d_probs.reshape(B, H).mean(axis=1).squeeze(-1)  # (B,)
+            seq_scores = d_probs.squeeze(-1).reshape(B, H).mean(axis=1)  # (B,)
             return seq_scores
 
         print("✅ Discriminator v6 ENABLED — Priority Sampling (NO reward shaping)")

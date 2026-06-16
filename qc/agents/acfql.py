@@ -75,23 +75,16 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         qs_buffer = self.network.select('critic')(batch['observations'], actions=batch_actions)
         q_buffer = jnp.mean(qs_buffer, axis=0)  # (batch_size,)
 
-        # 2. Evaluate V(s) by sampling actions from current policy
-        rng, noise_v_rng = jax.random.split(rng)
-        noises_v = jax.random.normal(noise_v_rng, (batch_size, action_dim))
-        if self.config["actor_type"] == "distill-ddpg":
-            curr_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises_v)
-        else:
-            curr_actions = self.compute_flow_actions(batch['observations'], noises=noises_v)
-        curr_actions = jnp.clip(curr_actions, -1, 1)
-        qs_curr = self.network.select('critic')(batch['observations'], actions=curr_actions)
-        v_s = jnp.mean(qs_curr, axis=0)  # (batch_size,)
-
-        # 3. Compute Advantage and Exponential Weights
-        advantage = jax.lax.stop_gradient(q_buffer - v_s)
-        tau = 3.0  # Temperature parameter (AWAC-style)
-        weights = jnp.exp(advantage / tau)
+        # 2. Compute Exponential Weights (Batch-Normalized Softmax)
+        # Instead of computing V(s) which requires a slow ODE solve (compute_flow_actions),
+        # we apply Softmax over the batch's Q-values. This naturally gives exponentially
+        # higher weights to the best transitions in the batch, acting as a soft Top-K filter.
+        tau = 3.0  # Temperature parameter
+        q_buffer_no_grad = jax.lax.stop_gradient(q_buffer)
+        
+        # Softmax normalize: sum(weights) = batch_size -> mean(weights) = 1.0
+        weights = jax.nn.softmax(q_buffer_no_grad / tau) * batch_size
         weights = jnp.clip(weights, 0.0, 100.0)  # Cap weights to prevent instability
-        weights = weights / (jnp.mean(weights) + 1e-8)  # Normalize batch weights
         
         # 4. Compute weighted MSE loss
         mse_loss = (pred - vel) ** 2

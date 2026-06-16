@@ -69,16 +69,44 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         pred = self.network.select('actor_bc_flow')(batch['observations'], x_t, t, params=grad_params)
 
-        # only bc on the valid chunk indices
-        if self.config["action_chunking"]:
-            bc_flow_loss = jnp.mean(
-                jnp.reshape(
-                    (pred - vel) ** 2, 
-                    (batch_size, self.config["horizon_length"], self.config["action_dim"]) 
-                ) * batch["valid"][..., None]
-            )
+        # --- OPTION 3: Advantage-Weighted Flow Matching ---
+        # 1. Evaluate Q-value of the actions in the batch (Q_buffer)
+        # We don't pass grad_params so no gradients flow into the critic
+        qs_buffer = self.network.select('critic')(batch['observations'], actions=batch_actions)
+        q_buffer = jnp.mean(qs_buffer, axis=0)  # (batch_size,)
+
+        # 2. Evaluate V(s) by sampling actions from current policy
+        rng, noise_v_rng = jax.random.split(rng)
+        noises_v = jax.random.normal(noise_v_rng, (batch_size, action_dim))
+        if self.config["actor_type"] == "distill-ddpg":
+            curr_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises_v)
         else:
-            bc_flow_loss = jnp.mean(jnp.square(pred - vel))
+            curr_actions = self.compute_flow_actions(batch['observations'], noises=noises_v)
+        curr_actions = jnp.clip(curr_actions, -1, 1)
+        qs_curr = self.network.select('critic')(batch['observations'], actions=curr_actions)
+        v_s = jnp.mean(qs_curr, axis=0)  # (batch_size,)
+
+        # 3. Compute Advantage and Exponential Weights
+        advantage = jax.lax.stop_gradient(q_buffer - v_s)
+        tau = 3.0  # Temperature parameter (AWAC-style)
+        weights = jnp.exp(advantage / tau)
+        weights = jnp.clip(weights, 0.0, 100.0)  # Cap weights to prevent instability
+        weights = weights / (jnp.mean(weights) + 1e-8)  # Normalize batch weights
+        
+        # 4. Compute weighted MSE loss
+        mse_loss = (pred - vel) ** 2
+        if self.config["action_chunking"]:
+            mse_loss = jnp.reshape(
+                mse_loss, 
+                (batch_size, self.config["horizon_length"], self.config["action_dim"]) 
+            ) * batch["valid"][..., None]
+            per_sample_loss = jnp.mean(mse_loss, axis=(1, 2))
+        else:
+            per_sample_loss = jnp.mean(mse_loss, axis=-1)
+
+        # Apply advantage weights
+        bc_flow_loss = jnp.mean(per_sample_loss * weights)
+        # ---------------------------------------------------
 
         if self.config["actor_type"] == "distill-ddpg":
             # Distillation loss.

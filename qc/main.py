@@ -126,10 +126,6 @@ def main(_):
         if 'success' in info: logger.log({"success": float(info['success'])}, "env", step=log_step)
 
         if done:
-            is_success_label = 1.0 if float(info.get('success', False)) == 1.0 else 0.0
-            episode_return = sum(t['rewards'] for t in current_episode)
-            recent_returns.append(episode_return)
-            
             # Add ALL transitions to agent replay buffer
             for t in current_episode:
                 agent_replay_buffer.add_transition(t)

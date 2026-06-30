@@ -75,16 +75,16 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         qs_buffer = self.network.select('critic')(batch['observations'], actions=batch_actions)
         q_buffer = jnp.mean(qs_buffer, axis=0)  # (batch_size,)
 
-        # 2. Compute Exponential Weights (Batch-Normalized Softmax)
-        # Instead of computing V(s) which requires a slow ODE solve (compute_flow_actions),
-        # we apply Softmax over the batch's Q-values. This naturally gives exponentially
-        # higher weights to the best transitions in the batch, acting as a soft Top-K filter.
-        tau = 3.0  # Temperature parameter
+        # 2. Compute Top-50% Advantage Weights
         q_buffer_no_grad = jax.lax.stop_gradient(q_buffer)
         
-        # Softmax normalize: sum(weights) = batch_size -> mean(weights) = 1.0
-        weights = jax.nn.softmax(q_buffer_no_grad / tau) * batch_size
-        weights = jnp.clip(weights, 0.0, 100.0)  # Cap weights to prevent instability
+        if self.config.get("use_q_weighting", True):
+            # Top-50% filtering: Only actions above median Q get weight 2.0, others 0.0
+            median_q = jnp.median(q_buffer_no_grad)
+            weights = jnp.where(q_buffer_no_grad >= median_q, 2.0, 0.0)
+        else:
+            # Base behavior: All actions get weight 1.0 (no Q-weighting)
+            weights = jnp.ones_like(q_buffer_no_grad)
         
         # 4. Compute weighted MSE loss
         mse_loss = (pred - vel) ** 2
@@ -361,6 +361,7 @@ def get_config():
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,
+            use_q_weighting=True,
         )
     )
     return config

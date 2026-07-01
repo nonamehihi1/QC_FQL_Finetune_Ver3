@@ -101,8 +101,8 @@ def main(_):
     agent = agents[config['agent_name']].create(FLAGS.seed, example_batch['observations'], example_batch['actions'], config)
 
     if FLAGS.use_discriminator:
-        from models.discriminator import SuccessDiscriminator
-        disc_model = SuccessDiscriminator()
+        from models.discriminator import PerStepDiscriminator
+        disc_model = PerStepDiscriminator()
         disc_rng = jax.random.PRNGKey(FLAGS.seed + 999)
         disc_params = disc_model.init(disc_rng, example_batch['observations'][None], example_batch['actions'][None])['params']
         disc_tx = optax.adam(learning_rate=3e-4)

@@ -12,10 +12,10 @@ Cấu hình này tắt `use_q_weighting`, tức là mạng Flow sẽ học toàn
 
 ```bash
 # Trên Task 3
-python qc/main.py --env cube-triple-play-singletask-task3-v0 --use_discriminator=True --use_q_weighting=False --disc_beta=0.2 --seed=1
+python qc/main.py --env_name cube-triple-play-singletask-task3-v0 --use_discriminator=True --use_q_weighting=False --disc_beta=0.2 --seed=1
 
 # Trên Task 4 
-python qc/main.py --env cube-triple-play-singletask-task4-v0 --use_discriminator=True --use_q_weighting=False --disc_beta=0.2 --seed=1
+python qc/main.py --env_name cube-triple-play-singletask-task4-v0 --use_discriminator=True --use_q_weighting=False --disc_beta=0.2 --seed=1
 ```
 
 ## 2. Config B: Good-bad + Actor Loss (Sử dụng CẢ HAI)
@@ -23,10 +23,10 @@ Cấu hình này bật cả 2 tính năng: Vừa phạt hành động xấu bằ
 
 ```bash
 # Trên Task 3
-python qc/main.py --env cube-triple-play-singletask-task3-v0 --use_discriminator=True --use_q_weighting=True --disc_beta=0.2 --seed=1
+python qc/main.py --env_name cube-triple-play-singletask-task3-v0 --use_discriminator=True --use_q_weighting=True --disc_beta=0.2 --seed=1
 
 # Trên Task 4
-python qc/main.py --env cube-triple-play-singletask-task4-v0 --use_discriminator=True --use_q_weighting=True --disc_beta=0.2 --seed=1
+python qc/main.py --env_name cube-triple-play-singletask-task4-v0 --use_discriminator=True --use_q_weighting=True --disc_beta=0.2 --seed=1
 ```
 
 ## 3. Base (Nếu cần so sánh thêm)

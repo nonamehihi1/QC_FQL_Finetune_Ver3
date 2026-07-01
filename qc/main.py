@@ -77,7 +77,7 @@ def main(_):
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
-        json.dump(get_flag_dict(), f)
+        json.dump(get_flag_dict(), f, default=str)
 
     config = FLAGS.agent
     # Pass the CLI flag for use_q_weighting down to the agent config

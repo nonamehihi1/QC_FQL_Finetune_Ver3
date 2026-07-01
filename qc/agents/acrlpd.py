@@ -77,7 +77,7 @@ class ACRLPDAgent(flax.struct.PyTreeNode):
 
         dist = self.network.select('actor')(batch['observations'], params=grad_params)
         actions = dist.sample(seed=rng)
-        log_probs = dist.log_prob(actions)
+        log_probs = dist.log_prob(jnp.clip(actions, -1 + 1e-6, 1 - 1e-6))
 
         # Actor loss.
         qs = self.network.select('critic')(batch['observations'], actions)

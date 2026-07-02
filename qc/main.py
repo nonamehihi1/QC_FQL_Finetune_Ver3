@@ -111,8 +111,8 @@ def main(_):
         @jax.jit
         def update_discriminator_step(params, opt_state, batch_obs, batch_acts, batch_labels, rng_key):
             def disc_loss_fn(p):
-                pred = disc_model.apply({'params': p}, batch_obs, batch_acts, deterministic=False, rngs={'dropout': rng_key})
-                return -jnp.mean(batch_labels * jnp.log(pred + 1e-8) + (1 - batch_labels) * jnp.log(1 - pred + 1e-8))
+                logits = disc_model.apply({'params': p}, batch_obs, batch_acts, deterministic=False, rngs={'dropout': rng_key})
+                return jnp.mean(optax.sigmoid_binary_cross_entropy(logits, batch_labels))
             grads = jax.grad(disc_loss_fn)(params)
             updates, new_opt_state = disc_tx.update(grads, opt_state)
             return optax.apply_updates(params, updates), new_opt_state
@@ -124,7 +124,8 @@ def main(_):
             flat_obs = batch_full_obs.reshape((B * H, -1))
             flat_acts = batch_acts.reshape((B * H, -1))
             
-            d_probs_flat = disc_model.apply({'params': params}, flat_obs, flat_acts, deterministic=True)
+            d_logits_flat = disc_model.apply({'params': params}, flat_obs, flat_acts, deterministic=True)
+            d_probs_flat = jax.nn.sigmoid(d_logits_flat)
             
             # --- PENALTY LOGIC ---
             # d_probs_flat là xác suất thuộc về expert (thành công)

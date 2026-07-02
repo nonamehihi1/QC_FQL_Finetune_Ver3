@@ -27,6 +27,6 @@ class PerStepDiscriminator(nn.Module):
             x = nn.leaky_relu(x, negative_slope=0.2)
             x = nn.Dropout(rate=self.dropout_rate, deterministic=deterministic)(x)
             
-        # Output probability ∈ [0, 1] via Sigmoid
+        # Output logits instead of probabilities for numerical stability
         x = nn.Dense(1)(x)
-        return nn.sigmoid(x)
+        return x

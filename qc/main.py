@@ -40,10 +40,11 @@ flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 
 # Added flags for Config A & B
-flags.DEFINE_boolean('use_discriminator', True, 'Use discriminator penalty (Good-bad)')
+flags.DEFINE_boolean('use_discriminator', False, 'Use discriminator penalty (Good-bad)')
 flags.DEFINE_boolean('use_q_weighting', True, 'Use Q-weighting for L_flow (Actor loss)')
 flags.DEFINE_float('disc_beta', 0.2, 'Discriminator penalty scale')
 flags.DEFINE_integer('disc_update_interval', 1, 'Discriminator update interval')
+flags.DEFINE_float('alpha_penalty', 1.0, 'Penalty alpha for Likelihood (DRIFT)')
 
 config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)
 
@@ -67,7 +68,9 @@ def main(_):
     exp_name = get_exp_name(FLAGS.seed)
     
     # Modify exp_name based on config to make it clear in wandb
-    if FLAGS.use_discriminator and not FLAGS.use_q_weighting:
+    if FLAGS.alpha_penalty > 0.0:
+        exp_name = f"LikelihoodPenalty_{FLAGS.alpha_penalty}_{exp_name}"
+    elif FLAGS.use_discriminator and not FLAGS.use_q_weighting:
         exp_name = f"ConfigA_DisOnly_{exp_name}"
     elif FLAGS.use_discriminator and FLAGS.use_q_weighting:
         exp_name = f"ConfigB_DisAndQWeight_{exp_name}"
@@ -82,6 +85,7 @@ def main(_):
     config = FLAGS.agent
     # Pass the CLI flag for use_q_weighting down to the agent config
     config['use_q_weighting'] = FLAGS.use_q_weighting
+    config['alpha_penalty'] = FLAGS.alpha_penalty
 
     if FLAGS.ogbench_dataset_dir is not None:
         dataset_paths = [file for file in sorted(glob.glob(f"{FLAGS.ogbench_dataset_dir}/*.npz")) if '-val.npz' not in file]

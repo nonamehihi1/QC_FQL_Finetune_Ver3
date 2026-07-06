@@ -28,8 +28,31 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             batch_actions = batch["actions"][..., 0, :] # take the first action
         
         # TD loss
-        rng, sample_rng = jax.random.split(rng)
+        rng, sample_rng, flow_rng, x_rng, t_rng = jax.random.split(rng, 5)
         next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
+
+        # ----------------- LIKELIHOOD PENALTY (DRIFT SOTA) -----------------
+        batch_size_next = next_actions.shape[0]
+        x_0 = jax.random.normal(x_rng, next_actions.shape)
+        x_1 = next_actions
+        t = jax.random.uniform(t_rng, (batch_size_next, 1))
+        x_t = (1 - t) * x_0 + t * x_1
+        vel = x_1 - x_0
+        
+        # Predict velocity using offline BC flow model (without grad)
+        pred_vel = self.network.select('actor_bc_flow')(batch['next_observations'][..., -1, :], x_t, t)
+        pred_vel = jax.lax.stop_gradient(pred_vel)
+
+        # Surrogate NLL (MSE of Flow Matching)
+        mse_nll = (pred_vel - vel) ** 2
+        if self.config["action_chunking"]:
+            mse_nll = jnp.reshape(mse_nll, (batch_size_next, self.config["horizon_length"], self.config["action_dim"]))
+            nll_surrogate = jnp.mean(mse_nll, axis=(1, 2))
+        else:
+            nll_surrogate = jnp.mean(mse_nll, axis=-1)
+            
+        penalty = self.config.get("alpha_penalty", 0.0) * nll_surrogate
+        # -------------------------------------------------------------------
 
         next_qs = self.network.select(f'target_critic')(batch['next_observations'][..., -1, :], actions=next_actions)
         if self.config['q_agg'] == 'min':
@@ -37,8 +60,9 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         else:
             next_q = next_qs.mean(axis=0)
         
+        # APPLY PENALTY to Next Q
         target_q = batch['rewards'][..., -1] + \
-            (self.config['discount'] ** self.config["horizon_length"]) * batch['masks'][..., -1] * next_q
+            (self.config['discount'] ** self.config["horizon_length"]) * batch['masks'][..., -1] * (next_q - penalty)
 
         q = self.network.select('critic')(batch['observations'], actions=batch_actions, params=grad_params)
         
@@ -362,6 +386,7 @@ def get_config():
             fourier_feature_dim=64,
             weight_decay=0.,
             use_q_weighting=True,
+            alpha_penalty=0.0,
         )
     )
     return config

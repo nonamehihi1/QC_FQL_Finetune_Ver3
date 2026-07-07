@@ -167,14 +167,20 @@ def main(_):
             episode_returns.append(ep_return)
             episode_ranges.append((start, end+1))
         
-        # 2. Tính median và chia 50/50
+        # 2. Sắp xếp các episode theo return và chia đôi chính xác 50/50
+        sorted_ep_idxs = np.argsort(episode_returns)
+        mid_point = len(sorted_ep_idxs) // 2
+        
+        bad_ep_idxs = set(sorted_ep_idxs[:mid_point])
+        good_ep_idxs = set(sorted_ep_idxs[mid_point:])
+        
         median_return = float(np.median(episode_returns))
         print(f"📊 Offline dataset: {len(episode_returns)} episodes, median return = {median_return:.2f}")
         
         good_idxs = []
         bad_idxs = []
-        for i, (ret, (start, end)) in enumerate(zip(episode_returns, episode_ranges)):
-            if ret >= median_return:
+        for i, (start, end) in enumerate(episode_ranges):
+            if i in good_ep_idxs:
                 good_idxs.extend(range(start, end))
             else:
                 bad_idxs.extend(range(start, end))
@@ -225,7 +231,9 @@ def main(_):
             for t in current_episode:
                 agent_replay_buffer.add_transition(t)
                 if FLAGS.use_discriminator:
-                    if episode_return >= running_median:
+                    # Chú ý: Dùng dấu '>' thay vì '>=' để nếu agent liên tục thất bại ở mức điểm sàn (ví dụ -3000)
+                    # và median cũng tụt xuống -3000, thì các episode -3000 tiếp theo sẽ bị đẩy vào fail_buffer.
+                    if episode_return > running_median or (episode_return == running_median and episode_return > -3000.0):
                         success_buffer.add_transition(t)
                     else:
                         fail_buffer.add_transition(t)

@@ -28,7 +28,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             batch_actions = batch["actions"][..., 0, :] # take the first action
         
         # TD loss
-        rng, sample_rng, x_rng, t_rng = jax.random.split(rng, 4)
+        rng, sample_rng = jax.random.split(rng)
         next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
 
         next_qs = self.network.select(f'target_critic')(batch['next_observations'][..., -1, :], actions=next_actions)
@@ -37,46 +37,8 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         else:
             next_q = next_qs.mean(axis=0)
         
-        # Standard Bellman target (penalty applied OUTSIDE discount bracket)
         target_q = batch['rewards'][..., -1] + \
             (self.config['discount'] ** self.config["horizon_length"]) * batch['masks'][..., -1] * next_q
-
-        # ----------------- LIKELIHOOD PENALTY v9 (Frozen + Normalized) -----------------
-        alpha_p = self.config.get("alpha_penalty", 0.0)
-        if alpha_p > 0.0:
-            batch_size_next = next_actions.shape[0]
-            x_0 = jax.random.normal(x_rng, next_actions.shape)
-            x_1 = next_actions
-            t = jax.random.uniform(t_rng, (batch_size_next, 1))
-            x_t = (1 - t) * x_0 + t * x_1
-            vel = x_1 - x_0
-            
-            # FIX 1: Use FROZEN offline flow model (never updated during training)
-            pred_vel = self.network.select('frozen_actor_bc_flow')(
-                batch['next_observations'][..., -1, :], x_t, t)
-            pred_vel = jax.lax.stop_gradient(pred_vel)
-
-            # Surrogate NLL (MSE of Flow Matching)
-            mse_nll = (pred_vel - vel) ** 2
-            if self.config["action_chunking"]:
-                mse_nll = jnp.reshape(mse_nll, (batch_size_next, self.config["horizon_length"], self.config["action_dim"]))
-                nll_surrogate = jnp.mean(mse_nll, axis=(1, 2))
-            else:
-                nll_surrogate = jnp.mean(mse_nll, axis=-1)
-            
-            # FIX 2: Normalize penalty by batch statistics for auto-scaling
-            nll_mean = jax.lax.stop_gradient(jnp.mean(nll_surrogate))
-            nll_std = jax.lax.stop_gradient(jnp.std(nll_surrogate) + 1e-6)
-            nll_normalized = (nll_surrogate - nll_mean) / nll_std  # zero-mean, unit-var
-            
-            # FIX 2: Penalty applied OUTSIDE the discount bracket, scaled by Q magnitude
-            q_scale = jax.lax.stop_gradient(jnp.abs(next_q).mean() + 1e-6)
-            penalty = alpha_p * q_scale * jnp.clip(nll_normalized, 0.0, 5.0)
-            
-            target_q = target_q - penalty
-        else:
-            penalty = jnp.zeros(())
-        # -------------------------------------------------------------------
 
         q = self.network.select('critic')(batch['observations'], actions=batch_actions, params=grad_params)
         
@@ -87,7 +49,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             'q_mean': q.mean(),
             'q_max': q.max(),
             'q_min': q.min(),
-            'penalty_mean': jnp.mean(penalty),
         }
 
     def actor_loss(self, batch, grad_params, rng):
@@ -341,23 +302,12 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             encoder=encoders.get('actor_onestep_flow'),
         )
 
-        
-        # Create a frozen copy of the BC flow model for Likelihood Penalty
-        frozen_actor_bc_flow_def = ActorVectorField(
-            hidden_dims=config['actor_hidden_dims'],
-            action_dim=full_action_dim,
-            layer_norm=config['actor_layer_norm'],
-            encoder=encoders.get('actor_bc_flow'),
-            use_fourier_features=config["use_fourier_features"],
-            fourier_feature_dim=config["fourier_feature_dim"],
-        )
 
         network_info = dict(
             actor_bc_flow=(actor_bc_flow_def, (ex_observations, full_actions, ex_times)),
             actor_onestep_flow=(actor_onestep_flow_def, (ex_observations, full_actions)),
             critic=(critic_def, (ex_observations, full_actions)),
             target_critic=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
-            frozen_actor_bc_flow=(frozen_actor_bc_flow_def, (ex_observations, full_actions, ex_times)),
         )
         if encoders.get('actor_bc_flow') is not None:
             # Add actor_bc_flow_encoder to ModuleDict to make it separately callable.
@@ -376,8 +326,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         params = network.params
 
         params[f'modules_target_critic'] = params[f'modules_critic']
-        # Copy initial (offline-trained) BC flow params to frozen copy
-        params[f'modules_frozen_actor_bc_flow'] = copy.deepcopy(params[f'modules_actor_bc_flow'])
 
         config['ob_dims'] = ob_dims
         config['action_dim'] = action_dim
@@ -414,7 +362,6 @@ def get_config():
             fourier_feature_dim=64,
             weight_decay=0.,
             use_q_weighting=True,
-            alpha_penalty=0.0,
         )
     )
     return config

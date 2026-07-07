@@ -39,12 +39,12 @@ flags.DEFINE_integer('eval_episodes', 10, 'Number of eval episodes.')
 flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 
-# Added flags for Config A & B
-flags.DEFINE_boolean('use_discriminator', False, 'Use discriminator penalty (Good-bad)')
+# Discriminator flags
+flags.DEFINE_boolean('use_discriminator', False, 'Use discriminator reward shaping')
 flags.DEFINE_boolean('use_q_weighting', True, 'Use Q-weighting for L_flow (Actor loss)')
 flags.DEFINE_float('disc_beta', 0.2, 'Discriminator penalty scale')
 flags.DEFINE_integer('disc_update_interval', 1, 'Discriminator update interval')
-flags.DEFINE_float('alpha_penalty', 1.0, 'Penalty alpha for Likelihood (DRIFT)')
+flags.DEFINE_integer('disc_median_window', 100, 'Window size for running median of episode returns')
 
 config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)
 
@@ -67,13 +67,9 @@ class LoggingHelper:
 def main(_):
     exp_name = get_exp_name(FLAGS.seed)
     
-    # Modify exp_name based on config to make it clear in wandb
-    if FLAGS.alpha_penalty > 0.0:
-        exp_name = f"LikelihoodPenalty_{FLAGS.alpha_penalty}_{exp_name}"
-    elif FLAGS.use_discriminator and not FLAGS.use_q_weighting:
-        exp_name = f"ConfigA_DisOnly_{exp_name}"
-    elif FLAGS.use_discriminator and FLAGS.use_q_weighting:
-        exp_name = f"ConfigB_DisAndQWeight_{exp_name}"
+    # Modify exp_name based on config
+    if FLAGS.use_discriminator:
+        exp_name = f"Dis_{FLAGS.disc_beta}_{exp_name}"
         
     run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name)
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
@@ -83,9 +79,7 @@ def main(_):
         json.dump(get_flag_dict(), f, default=str)
 
     config = FLAGS.agent
-    # Pass the CLI flag for use_q_weighting down to the agent config
     config['use_q_weighting'] = FLAGS.use_q_weighting
-    config['alpha_penalty'] = FLAGS.alpha_penalty
 
     if FLAGS.ogbench_dataset_dir is not None:
         dataset_paths = [file for file in sorted(glob.glob(f"{FLAGS.ogbench_dataset_dir}/*.npz")) if '-val.npz' not in file]
@@ -131,18 +125,10 @@ def main(_):
             d_logits_flat = disc_model.apply({'params': params}, flat_obs, flat_acts, deterministic=True)
             d_probs_flat = jax.nn.sigmoid(d_logits_flat)
             
-            # --- PENALTY LOGIC ---
-            # d_probs_flat là xác suất thuộc về expert (thành công)
-            # Penalty tỉ lệ nghịch với d_probs_flat (d_probs càng nhỏ -> càng giống fail -> trừ càng nhiều)
-            # Dùng -(1.0 - d_probs) để tạo penalty âm (từ -1 đến 0)
+            # --- PENALTY PER-STEP (không cumsum) ---
             r_discs = -(1.0 - d_probs_flat).reshape((B, H))
-            # ---------------------
             
-            # Tính lũy kế bằng 1 phép nhân ma trận + jnp.cumsum (cực nhanh)
-            discount_powers = discount ** jnp.arange(H)
-            disc_rewards_cum = jnp.cumsum(r_discs * discount_powers, axis=1)
-            
-            new_rewards = batch_rewards + beta * disc_rewards_cum
+            new_rewards = batch_rewards + beta * r_discs
             return new_rewards, jnp.mean(r_discs)
         # ----------------------------------------------------------------------
 
@@ -163,14 +149,52 @@ def main(_):
                 num_eval_episodes=FLAGS.eval_episodes, num_video_episodes=0, video_frame_skip=3)
             logger.log(eval_info, "eval", step=log_step)
 
-    # ====================== KHỞI TẠO 3 BUFFER ======================
+    # ====================== KHỞI TẠO BUFFER ======================
     agent_replay_buffer = ReplayBuffer.create_from_initial_dataset(dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1))
     
     if FLAGS.use_discriminator:
-        success_buffer = ReplayBuffer.create_from_initial_dataset(dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1))
-        dummy_transition = jax.tree_util.tree_map(lambda x: np.zeros_like(x[0]), dict(train_dataset))
-        dummy_transition['is_success'] = 0.0
-        fail_buffer = ReplayBuffer.create(dummy_transition, size=FLAGS.buffer_size)
+        # --- RETURN-BASED SPLIT: Chia offline data theo median return ---
+        # 1. Tính return cho từng episode trong offline dataset
+        offline_rewards = np.array(train_dataset['rewards']).squeeze()
+        offline_terminals = np.array(train_dataset['terminals']).squeeze()
+        terminal_locs = np.nonzero(offline_terminals > 0)[0]
+        initial_locs = np.concatenate([[0], terminal_locs[:-1] + 1])
+        
+        episode_returns = []
+        episode_ranges = []
+        for start, end in zip(initial_locs, terminal_locs):
+            ep_return = float(np.sum(offline_rewards[start:end+1]))
+            episode_returns.append(ep_return)
+            episode_ranges.append((start, end+1))
+        
+        # 2. Tính median và chia 50/50
+        median_return = float(np.median(episode_returns))
+        print(f"📊 Offline dataset: {len(episode_returns)} episodes, median return = {median_return:.2f}")
+        
+        good_idxs = []
+        bad_idxs = []
+        for i, (ret, (start, end)) in enumerate(zip(episode_returns, episode_ranges)):
+            if ret >= median_return:
+                good_idxs.extend(range(start, end))
+            else:
+                bad_idxs.extend(range(start, end))
+        
+        # 3. Tạo buffer từ dữ liệu đã phân loại
+        def create_buffer_from_indices(indices, dataset_dict, buffer_size):
+            subset = {k: np.array(v)[indices] for k, v in dataset_dict.items()}
+            buf = ReplayBuffer.create_from_initial_dataset(subset, size=buffer_size)
+            return buf
+        
+        buf_size = max(FLAGS.buffer_size, train_dataset.size + 1)
+        success_buffer = create_buffer_from_indices(good_idxs, dict(train_dataset), buf_size)
+        fail_buffer = create_buffer_from_indices(bad_idxs, dict(train_dataset), buf_size)
+        
+        print(f"✅ Success buffer: {success_buffer.size} transitions ({len(good_idxs)} from offline)")
+        print(f"❌ Fail buffer: {fail_buffer.size} transitions ({len(bad_idxs)} from offline)")
+        
+        # 4. Running median tracker cho giai đoạn online
+        recent_returns = deque(episode_returns, maxlen=FLAGS.disc_median_window)
+        running_median = median_return
 
     # ====================== ONLINE RL ======================
     ob, _ = env.reset()
@@ -195,14 +219,21 @@ def main(_):
         if 'success' in info: logger.log({"success": float(info['success'])}, "env", step=log_step)
 
         if done:
-            is_success_label = 1.0 if (float(info.get('success', False)) == 1.0 or np.max([t['rewards'] for t in current_episode]) == 0.0) else 0.0
+            # --- RETURN-BASED LABELING ---
+            episode_return = sum(t['rewards'] for t in current_episode)
             
             for t in current_episode:
-                t['is_success'] = is_success_label
                 agent_replay_buffer.add_transition(t)
                 if FLAGS.use_discriminator:
-                    if is_success_label == 1.0: success_buffer.add_transition(t)
-                    else: fail_buffer.add_transition(t)
+                    if episode_return >= running_median:
+                        success_buffer.add_transition(t)
+                    else:
+                        fail_buffer.add_transition(t)
+            
+            # Cập nhật running median
+            if FLAGS.use_discriminator:
+                recent_returns.append(episode_return)
+                running_median = float(np.median(list(recent_returns)))
             
             current_episode, action_queue, (ob, _) = [], [], env.reset()
         else: ob = next_ob

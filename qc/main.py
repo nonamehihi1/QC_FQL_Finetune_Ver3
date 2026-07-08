@@ -44,7 +44,7 @@ flags.DEFINE_boolean('use_discriminator', False, 'Use discriminator reward shapi
 flags.DEFINE_boolean('use_q_weighting', True, 'Use Q-weighting for L_flow (Actor loss)')
 flags.DEFINE_float('disc_beta', 0.2, 'Discriminator penalty scale')
 flags.DEFINE_integer('disc_update_interval', 1, 'Discriminator update interval')
-flags.DEFINE_integer('disc_median_window', 100, 'Window size for running median of episode returns')
+flags.DEFINE_integer('disc_min_success', 5, 'Min online success episodes before activating Discriminator')
 
 config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)
 
@@ -153,54 +153,16 @@ def main(_):
     agent_replay_buffer = ReplayBuffer.create_from_initial_dataset(dict(train_dataset), size=max(FLAGS.buffer_size, train_dataset.size + 1))
     
     if FLAGS.use_discriminator:
-        # --- RETURN-BASED SPLIT: Chia offline data theo median return ---
-        # 1. Tính return cho từng episode trong offline dataset
-        offline_rewards = np.array(train_dataset['rewards']).squeeze()
-        offline_terminals = np.array(train_dataset['terminals']).squeeze()
-        terminal_locs = np.nonzero(offline_terminals > 0)[0]
-        initial_locs = np.concatenate([[0], terminal_locs[:-1] + 1])
+        # Buffer SẠCH: chỉ nhận online data, khởi tạo rỗng
+        dummy_transition = jax.tree_util.tree_map(lambda x: np.zeros_like(x[0]), dict(train_dataset))
+        success_buffer = ReplayBuffer.create(dummy_transition, size=FLAGS.buffer_size)
+        fail_buffer = ReplayBuffer.create(dummy_transition, size=FLAGS.buffer_size)
         
-        episode_returns = []
-        episode_ranges = []
-        for start, end in zip(initial_locs, terminal_locs):
-            ep_return = float(np.sum(offline_rewards[start:end+1]))
-            episode_returns.append(ep_return)
-            episode_ranges.append((start, end+1))
+        success_episode_count = 0
+        fail_episode_count = 0
+        disc_active = False
         
-        # 2. Sắp xếp các episode theo return và chia đôi chính xác 50/50
-        sorted_ep_idxs = np.argsort(episode_returns)
-        mid_point = len(sorted_ep_idxs) // 2
-        
-        bad_ep_idxs = set(sorted_ep_idxs[:mid_point])
-        good_ep_idxs = set(sorted_ep_idxs[mid_point:])
-        
-        median_return = float(np.median(episode_returns))
-        print(f"📊 Offline dataset: {len(episode_returns)} episodes, median return = {median_return:.2f}")
-        
-        good_idxs = []
-        bad_idxs = []
-        for i, (start, end) in enumerate(episode_ranges):
-            if i in good_ep_idxs:
-                good_idxs.extend(range(start, end))
-            else:
-                bad_idxs.extend(range(start, end))
-        
-        # 3. Tạo buffer từ dữ liệu đã phân loại
-        def create_buffer_from_indices(indices, dataset_dict, buffer_size):
-            subset = {k: np.array(v)[indices] for k, v in dataset_dict.items()}
-            buf = ReplayBuffer.create_from_initial_dataset(subset, size=buffer_size)
-            return buf
-        
-        buf_size = max(FLAGS.buffer_size, train_dataset.size + 1)
-        success_buffer = create_buffer_from_indices(good_idxs, dict(train_dataset), buf_size)
-        fail_buffer = create_buffer_from_indices(bad_idxs, dict(train_dataset), buf_size)
-        
-        print(f"✅ Success buffer: {success_buffer.size} transitions ({len(good_idxs)} from offline)")
-        print(f"❌ Fail buffer: {fail_buffer.size} transitions ({len(bad_idxs)} from offline)")
-        
-        # 4. Running median tracker cho giai đoạn online
-        recent_returns = deque(episode_returns, maxlen=FLAGS.disc_median_window)
-        running_median = median_return
+        print(f"⏳ GAIL Discriminator: STANDBY (sẽ kích hoạt sau {FLAGS.disc_min_success} online success episodes)")
 
     # ====================== ONLINE RL ======================
     ob, _ = env.reset()
@@ -225,30 +187,34 @@ def main(_):
         if 'success' in info: logger.log({"success": float(info['success'])}, "env", step=log_step)
 
         if done:
-            # --- RETURN-BASED LABELING ---
-            episode_return = sum(t['rewards'] for t in current_episode)
+            is_success = float(info.get('success', False)) == 1.0
             
             for t in current_episode:
                 agent_replay_buffer.add_transition(t)
                 if FLAGS.use_discriminator:
-                    # Chú ý: Dùng dấu '>' thay vì '>=' để nếu agent liên tục thất bại ở mức điểm sàn (ví dụ -3000)
-                    # và median cũng tụt xuống -3000, thì các episode -3000 tiếp theo sẽ bị đẩy vào fail_buffer.
-                    if episode_return > running_median or (episode_return == running_median and episode_return > -3000.0):
+                    if is_success:
                         success_buffer.add_transition(t)
                     else:
                         fail_buffer.add_transition(t)
             
-            # Cập nhật running median
             if FLAGS.use_discriminator:
-                recent_returns.append(episode_return)
-                running_median = float(np.median(list(recent_returns)))
+                if is_success:
+                    success_episode_count += 1
+                else:
+                    fail_episode_count += 1
+                
+                # Kích hoạt Discriminator khi đủ success
+                if not disc_active and success_episode_count >= FLAGS.disc_min_success:
+                    disc_active = True
+                    print(f"🟢 Discriminator ACTIVATED at step {log_step}! "
+                          f"(success={success_episode_count}, fail={fail_episode_count})")
             
             current_episode, action_queue, (ob, _) = [], [], env.reset()
         else: ob = next_ob
 
         # Discriminator Update
-        if FLAGS.use_discriminator and i >= FLAGS.start_training and i % FLAGS.disc_update_interval == 0:
-            if fail_buffer.size > 128:
+        if FLAGS.use_discriminator and disc_active and i >= FLAGS.start_training and i % FLAGS.disc_update_interval == 0:
+            if success_buffer.size > 128 and fail_buffer.size > 128:
                 s_batch, f_batch = success_buffer.sample(128), fail_buffer.sample(128)
                 batch_obs = np.concatenate([s_batch['observations'], f_batch['observations']], axis=0)
                 batch_acts = np.concatenate([s_batch['actions'], f_batch['actions']], axis=0)
@@ -264,7 +230,7 @@ def main(_):
                 target_batch_size, sequence_length=FLAGS.horizon_length, discount=FLAGS.discount)
             
             # --- CHẤM ĐIỂM REWARD (PENALTY) ĐƯỢC TỐI ƯU SIÊU TỐC ---
-            if FLAGS.use_discriminator:
+            if FLAGS.use_discriminator and disc_active:
                 new_rewards, r_disc_mean = compute_gail_batch(
                     disc_params, 
                     batch['full_observations'], 
@@ -274,7 +240,10 @@ def main(_):
                     FLAGS.disc_beta
                 )
                 batch['rewards'] = np.array(new_rewards)
-                logger.log({"r_disc_mean": float(r_disc_mean)}, "disc", step=log_step)
+                logger.log({"r_disc_mean": float(r_disc_mean),
+                            "disc_active": 1.0,
+                            "success_episodes": success_episode_count,
+                            "fail_episodes": fail_episode_count}, "disc", step=log_step)
             # ---------------------------------------------
 
             batch = jax.tree_util.tree_map(lambda x: x.reshape((FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)

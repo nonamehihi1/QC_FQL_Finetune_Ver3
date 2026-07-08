@@ -14,7 +14,7 @@ class PerStepDiscriminator(nn.Module):
     - Spectral-norm-friendly architecture (simple Dense + activation)
     """
     hidden_dims: tuple = (512, 512, 256)
-    dropout_rate: float = 0.05
+    dropout_rate: float = 0.20
 
     @nn.compact
     def __call__(self, observations, action, deterministic: bool = True):

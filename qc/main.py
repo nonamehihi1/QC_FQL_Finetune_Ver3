@@ -43,7 +43,7 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_boolean('use_discriminator', False, 'Use discriminator reward shaping')
 flags.DEFINE_boolean('use_q_weighting', True, 'Use Q-weighting for L_flow (Actor loss)')
 flags.DEFINE_float('disc_beta', 0.2, 'Discriminator penalty scale')
-flags.DEFINE_integer('disc_update_interval', 1, 'Discriminator update interval')
+flags.DEFINE_integer('disc_update_interval', 10, 'Discriminator update interval')
 flags.DEFINE_integer('disc_min_success', 5, 'Min online success episodes before activating Discriminator')
 
 config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)
@@ -108,8 +108,17 @@ def main(_):
 
         @jax.jit
         def update_discriminator_step(params, opt_state, batch_obs, batch_acts, batch_labels, rng_key):
+            noise_key, dropout_key = jax.random.split(rng_key)
+            
+            # --- V13: INPUT NOISE CHỐNG OVERFIT ---
+            obs_noise = jax.random.normal(noise_key, batch_obs.shape) * 0.01
+            act_noise = jax.random.normal(noise_key, batch_acts.shape) * 0.01
+            
+            noisy_obs = batch_obs + obs_noise
+            noisy_acts = batch_acts + act_noise
+            
             def disc_loss_fn(p):
-                logits = disc_model.apply({'params': p}, batch_obs, batch_acts, deterministic=False, rngs={'dropout': rng_key})
+                logits = disc_model.apply({'params': p}, noisy_obs, noisy_acts, deterministic=False, rngs={'dropout': dropout_key})
                 return jnp.mean(optax.sigmoid_binary_cross_entropy(logits, batch_labels))
             grads = jax.grad(disc_loss_fn)(params)
             updates, new_opt_state = disc_tx.update(grads, opt_state)
@@ -218,7 +227,10 @@ def main(_):
                 s_batch, f_batch = success_buffer.sample(128), fail_buffer.sample(128)
                 batch_obs = np.concatenate([s_batch['observations'], f_batch['observations']], axis=0)
                 batch_acts = np.concatenate([s_batch['actions'], f_batch['actions']], axis=0)
-                labels = np.concatenate([np.ones((128, 1)), np.zeros((128, 1))], axis=0)
+                
+                # --- V13: LABEL SMOOTHING ---
+                # Thay vì 1.0 và 0.0, dùng 0.9 và 0.1 để Discriminator không bị Overconfident
+                labels = np.concatenate([np.full((128, 1), 0.9), np.full((128, 1), 0.1)], axis=0)
                 
                 online_rng, dropout_key = jax.random.split(online_rng)
                 disc_params, disc_opt_state = update_discriminator_step(disc_params, disc_opt_state, batch_obs, batch_acts, labels, dropout_key)

@@ -44,7 +44,7 @@ flags.DEFINE_boolean('use_discriminator', False, 'Use discriminator reward shapi
 flags.DEFINE_boolean('use_q_weighting', True, 'Use Q-weighting for L_flow (Actor loss)')
 flags.DEFINE_float('disc_beta', 0.2, 'Discriminator penalty scale')
 flags.DEFINE_integer('disc_update_interval', 10, 'Discriminator update interval')
-flags.DEFINE_integer('disc_min_success', 5, 'Min online success episodes before activating Discriminator')
+flags.DEFINE_integer('disc_min_success', 200, 'Min online success episodes before activating Discriminator')
 
 config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)
 

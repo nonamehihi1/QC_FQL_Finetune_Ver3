@@ -40,6 +40,31 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         target_q = batch['rewards'][..., -1] + \
             (self.config['discount'] ** self.config["horizon_length"]) * batch['masks'][..., -1] * next_q
 
+        # Flow Likelihood Penalty (Surrogate NLL)
+        nll_surrogate = jnp.zeros_like(target_q)
+        if self.config.get('alpha_penalty', 0.0) > 0.0:
+            rng, x_rng, t_rng = jax.random.split(rng, 3)
+            # next_actions is already chunked. Shape: (batch_size, action_dim * horizon)
+            x_1 = next_actions 
+            batch_size = x_1.shape[0]
+            
+            x_0 = jax.random.normal(x_rng, x_1.shape)
+            t = jax.random.uniform(t_rng, (batch_size, 1))
+            
+            x_t = (1 - t) * x_0 + t * x_1
+            vel = x_1 - x_0
+            
+            # Predict velocity from Offline Flow Model (actor_bc_flow)
+            pred_vel = self.network.select('actor_bc_flow')(
+                batch['next_observations'][..., -1, :], x_t, t
+            )
+            
+            # Compute MSE Surrogate (Mean over action dimension, per sample)
+            nll_surrogate = jnp.mean((pred_vel - vel) ** 2, axis=-1)
+            
+            # Apply penalty
+            target_q = target_q - self.config['alpha_penalty'] * nll_surrogate
+
         q = self.network.select('critic')(batch['observations'], actions=batch_actions, params=grad_params)
         
         critic_loss = (jnp.square(q - target_q) * batch['valid'][..., -1]).mean()
@@ -49,6 +74,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             'q_mean': q.mean(),
             'q_max': q.max(),
             'q_min': q.min(),
+            'nll_surrogate': nll_surrogate.mean(),
         }
 
     def actor_loss(self, batch, grad_params, rng):
@@ -362,6 +388,7 @@ def get_config():
             fourier_feature_dim=64,
             weight_decay=0.,
             use_q_weighting=True,
+            alpha_penalty=0.0,
         )
     )
     return config

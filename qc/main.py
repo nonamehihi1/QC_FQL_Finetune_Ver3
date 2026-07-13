@@ -46,6 +46,9 @@ flags.DEFINE_float('disc_beta', 0.2, 'Discriminator penalty scale')
 flags.DEFINE_integer('disc_update_interval', 10, 'Discriminator update interval')
 flags.DEFINE_integer('disc_min_success', 200, 'Min online success episodes before activating Discriminator')
 
+# Likelihood Penalty (FPQL) flag
+flags.DEFINE_float('alpha_penalty', 0.0, 'Scale for Likelihood Penalty (Surrogate NLL). Default 0.0 means off.')
+
 config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)
 
 flags.DEFINE_float('dataset_proportion', 1.0, "Proportion of the dataset to use")
@@ -70,6 +73,8 @@ def main(_):
     # Modify exp_name based on config
     if FLAGS.use_discriminator:
         exp_name = f"Dis_{FLAGS.disc_beta}_{exp_name}"
+    if FLAGS.alpha_penalty > 0.0:
+        exp_name = f"Likelihood_{FLAGS.alpha_penalty}_{exp_name}"
         
     run = setup_wandb(project='qc', group=FLAGS.run_group, name=exp_name)
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
@@ -80,6 +85,7 @@ def main(_):
 
     config = FLAGS.agent
     config['use_q_weighting'] = FLAGS.use_q_weighting
+    config['alpha_penalty'] = FLAGS.alpha_penalty
 
     if FLAGS.ogbench_dataset_dir is not None:
         dataset_paths = [file for file in sorted(glob.glob(f"{FLAGS.ogbench_dataset_dir}/*.npz")) if '-val.npz' not in file]

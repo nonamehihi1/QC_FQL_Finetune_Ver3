@@ -285,14 +285,18 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             fourier_feature_dim=config["fourier_feature_dim"],
         )
 
+        critic_1_def = critic_def
+        critic_3_def = copy.deepcopy(critic_def)
+        critic_5_def = copy.deepcopy(critic_def)
+
         network_info = dict(
             actor_bc_flow=(actor_bc_flow_def, (ex_observations, full_actions, ex_times)),
-            critic_1=(critic_def, (ex_observations, full_actions)),
-            target_critic_1=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
-            critic_3=(critic_def, (ex_observations, full_actions)),
-            target_critic_3=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
-            critic_5=(critic_def, (ex_observations, full_actions)),
-            target_critic_5=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
+            critic_1=(critic_1_def, (ex_observations, full_actions)),
+            target_critic_1=(copy.deepcopy(critic_1_def), (ex_observations, full_actions)),
+            critic_3=(critic_3_def, (ex_observations, full_actions)),
+            target_critic_3=(copy.deepcopy(critic_3_def), (ex_observations, full_actions)),
+            critic_5=(critic_5_def, (ex_observations, full_actions)),
+            target_critic_5=(copy.deepcopy(critic_5_def), (ex_observations, full_actions)),
         )
         if encoders.get('actor_bc_flow') is not None:
             network_info['actor_bc_flow_encoder'] = (encoders.get('actor_bc_flow'), (ex_observations,))

@@ -220,14 +220,15 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             # select optimal sample and k
             best_sample_idx = jnp.argmax(jnp.max(advs, axis=-1), axis=-1) # (batch,)
             
-            b_indices = jnp.arange(observations.shape[0]) if len(observations.shape) > 1 else jnp.arange(1)
-            if len(observations.shape) == 1:
-                # single observation
-                best_sample = best_sample_idx.reshape(-1)[0]
-                best_k_idx = jnp.argmax(advs[0, best_sample])
+            is_unbatched = (len(observations.shape) == len(self.config['ob_dims']))
+            
+            if is_unbatched:
+                best_sample = best_sample_idx
+                best_k_idx = jnp.argmax(advs[best_sample])
                 optimal_k = jnp.array([1, 3, 5])[best_k_idx]
-                optimal_action = actions[0, best_sample]
+                optimal_action = actions[best_sample]
             else:
+                b_indices = jnp.arange(observations.shape[0])
                 best_k_idx = jnp.argmax(advs[b_indices, best_sample_idx], axis=-1)
                 optimal_k = jnp.array([1, 3, 5])[best_k_idx]
                 optimal_action = actions[b_indices, best_sample_idx]

@@ -85,13 +85,13 @@ def evaluate(
         gripper_contact_length = 0
         while not done:
             
-            action = actor_fn(observations=observation)
+            actions_out, optimal_k = actor_fn(observations=observation)
 
             if len(action_queue) == 0:
                 have_new_action = True
-                action = np.array(action).reshape(-1, action_dim)
-                action_chunk_len = action.shape[0]
-                for a in action:
+                action_arr = np.array(actions_out).reshape(-1, action_dim)
+                action_chunk_len = int(optimal_k)
+                for a in action_arr[:action_chunk_len]:
                     action_queue.append(a)
             else:
                 have_new_action = False

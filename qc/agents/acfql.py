@@ -1,4 +1,5 @@
 import copy
+import functools
 from typing import Any
 
 import flax
@@ -35,8 +36,19 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         action_dim = self.config['action_dim']
         rng, sample_rng = jax.random.split(rng)
         
-        # sample_actions returns (actions, optimal_k), we just need actions
-        next_actions_full, _ = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
+        # Batch s_{t+1}, s_{t+3}, s_{t+5} for parallel target action sampling
+        obs_1 = batch['next_observations'][:, 0, :]
+        obs_3 = batch['next_observations'][:, 2, :]
+        obs_5 = batch['next_observations'][:, 4, :]
+        combined_obs = jnp.concatenate([obs_1, obs_3, obs_5], axis=0)
+        
+        # sample_actions returns (actions, optimal_k), we just need actions.
+        # Use num_samples=8 to drastically speed up offline training target computation
+        combined_actions_full, _ = self.sample_actions(combined_obs, rng=sample_rng, num_samples=8)
+        
+        # Split back to individual k's
+        act_1, act_3, act_5 = jnp.split(combined_actions_full, 3, axis=0)
+        acts_dict = {1: act_1, 3: act_3, 5: act_5}
 
         def compute_k_loss(k, target_critic_name, critic_name):
             # Compute k-step return
@@ -45,7 +57,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                 r_k += (self.config['discount'] ** i) * batch['rewards'][:, i]
             
             next_obs_k = batch['next_observations'][:, k-1, :]
-            masked_next_actions = self.mask_actions(next_actions_full, k, action_dim)
+            masked_next_actions = self.mask_actions(acts_dict[k], k, action_dim)
             
             next_qs = self.network.select(target_critic_name)(next_obs_k, actions=masked_next_actions)
             next_q = next_qs.min(axis=0) if self.config['q_agg'] == 'min' else next_qs.mean(axis=0)
@@ -182,8 +194,11 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         agent, infos = jax.lax.scan(self._update, self, batch)
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
     
-    @jax.jit
-    def sample_actions(self, observations, rng=None):
+    @functools.partial(jax.jit, static_argnames=('num_samples',))
+    def sample_actions(self, observations, rng=None, num_samples=None):
+        if num_samples is None:
+            num_samples = self.config["actor_num_samples"]
+            
         if self.config["actor_type"] == "best-of-n":
             action_dim = self.config['action_dim'] * \
                         (self.config['horizon_length'] if self.config["action_chunking"] else 1)
@@ -191,10 +206,10 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                 rng,
                 (
                     *observations.shape[: -len(self.config['ob_dims'])],  # batch_size
-                    self.config["actor_num_samples"], action_dim
+                    num_samples, action_dim
                 ),
             )
-            observations_rep = jnp.repeat(observations[..., None, :], self.config["actor_num_samples"], axis=-2)
+            observations_rep = jnp.repeat(observations[..., None, :], num_samples, axis=-2)
             actions = self.compute_flow_actions(observations_rep, noises)
             actions = jnp.clip(actions, -1, 1)
             

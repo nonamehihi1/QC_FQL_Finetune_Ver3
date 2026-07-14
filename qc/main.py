@@ -189,8 +189,11 @@ def main(_):
         online_rng, key = jax.random.split(online_rng)
 
         if len(action_queue) == 0:
-            action_chunk = np.array(agent.sample_actions(observations=ob, rng=key)).reshape(-1, example_batch["actions"].shape[-1])
-            action_queue.extend(action_chunk)
+            actions_out, optimal_k = agent.sample_actions(observations=ob, rng=key)
+            action_chunk = np.array(actions_out).reshape(-1, example_batch["actions"].shape[-1])
+            # TỰ ĐỘNG CHUNKING: Chỉ lấy k hành động tối ưu!
+            optimal_k_val = int(optimal_k)
+            action_queue.extend(action_chunk[:optimal_k_val])
         action = action_queue.pop(0)
 
         next_ob, int_reward, terminated, truncated, info = env.step(action)

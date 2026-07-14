@@ -12,82 +12,79 @@ from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, Value
 
 class ACFQLAgent(flax.struct.PyTreeNode):
-    """Flow Q-learning (FQL) agent with action chunking. 
+    """Flow Q-learning (FQL) agent with action chunking and AW-AFC. 
     """
 
     rng: Any
     network: Any
     config: Any = nonpytree_field()
 
-    def critic_loss(self, batch, grad_params, rng):
-        """Compute the FQL critic loss."""
+    def mask_actions(self, batch_actions, k, action_dim):
+        """Mask actions beyond step k for critic evaluation."""
+        horizon = self.config['horizon_length']
+        mask = jnp.arange(horizon * action_dim) < (k * action_dim)
+        return batch_actions * mask[None, :]
 
+    def critic_loss(self, batch, grad_params, rng):
+        """Compute the AW-AFC critic loss for multiple chunk scales."""
         if self.config["action_chunking"]:
             batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
         else:
-            batch_actions = batch["actions"][..., 0, :] # take the first action
-        
-        # TD loss
+            batch_actions = batch["actions"][..., 0, :]
+            
+        action_dim = self.config['action_dim']
         rng, sample_rng = jax.random.split(rng)
-        next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
-
-        next_qs = self.network.select(f'target_critic')(batch['next_observations'][..., -1, :], actions=next_actions)
-        if self.config['q_agg'] == 'min':
-            next_q = next_qs.min(axis=0)
-        else:
-            next_q = next_qs.mean(axis=0)
         
-        target_q = batch['rewards'][..., -1] + \
-            (self.config['discount'] ** self.config["horizon_length"]) * batch['masks'][..., -1] * next_q
+        # sample_actions returns (actions, optimal_k), we just need actions
+        next_actions_full, _ = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
 
-        # Flow Likelihood Penalty (Surrogate NLL)
-        nll_surrogate = jnp.zeros_like(target_q)
-        if self.config.get('alpha_penalty', 0.0) > 0.0:
-            rng, x_rng, t_rng = jax.random.split(rng, 3)
-            # next_actions is already chunked. Shape: (batch_size, action_dim * horizon)
-            x_1 = next_actions 
-            batch_size = x_1.shape[0]
+        def compute_k_loss(k, target_critic_name, critic_name):
+            # Compute k-step return
+            r_k = jnp.zeros_like(batch['rewards'][:, 0])
+            for i in range(k):
+                r_k += (self.config['discount'] ** i) * batch['rewards'][:, i]
             
-            x_0 = jax.random.normal(x_rng, x_1.shape)
-            t = jax.random.uniform(t_rng, (batch_size, 1))
+            next_obs_k = batch['next_observations'][:, k-1, :]
+            masked_next_actions = self.mask_actions(next_actions_full, k, action_dim)
             
-            x_t = (1 - t) * x_0 + t * x_1
-            vel = x_1 - x_0
+            next_qs = self.network.select(target_critic_name)(next_obs_k, actions=masked_next_actions)
+            next_q = next_qs.min(axis=0) if self.config['q_agg'] == 'min' else next_qs.mean(axis=0)
             
-            # Predict velocity from Offline Flow Model (actor_bc_flow)
-            pred_vel = self.network.select('actor_bc_flow')(
-                batch['next_observations'][..., -1, :], x_t, t
-            )
+            target_q = r_k + (self.config['discount'] ** k) * batch['masks'][:, k-1] * next_q
             
-            # Compute MSE Surrogate (Mean over action dimension, per sample)
-            nll_surrogate = jnp.mean((pred_vel - vel) ** 2, axis=-1)
+            masked_actions = self.mask_actions(batch_actions, k, action_dim)
+            q = self.network.select(critic_name)(batch['observations'], actions=masked_actions, params=grad_params)
             
-            # Apply penalty
-            target_q = target_q - self.config['alpha_penalty'] * nll_surrogate
+            loss = (jnp.square(q - target_q) * batch['valid'][:, k-1]).mean()
+            return loss, q
 
-        q = self.network.select('critic')(batch['observations'], actions=batch_actions, params=grad_params)
+        loss_1, q_1 = compute_k_loss(1, 'target_critic_1', 'critic_1')
+        loss_3, q_3 = compute_k_loss(3, 'target_critic_3', 'critic_3')
+        loss_5, q_5 = compute_k_loss(5, 'target_critic_5', 'critic_5')
         
-        critic_loss = (jnp.square(q - target_q) * batch['valid'][..., -1]).mean()
+        critic_loss = loss_1 + loss_3 + loss_5
 
         return critic_loss, {
             'critic_loss': critic_loss,
-            'q_mean': q.mean(),
-            'q_max': q.max(),
-            'q_min': q.min(),
-            'nll_surrogate': nll_surrogate.mean(),
+            'loss_1': loss_1,
+            'loss_3': loss_3,
+            'loss_5': loss_5,
+            'q_1_mean': q_1.mean(),
+            'q_3_mean': q_3.mean(),
+            'q_5_mean': q_5.mean(),
         }
 
     def actor_loss(self, batch, grad_params, rng):
-        """Compute the FQL actor loss."""
+        """Compute the FQL actor loss with max advantage weighting."""
         if self.config["action_chunking"]:
-            batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))  # fold in horizon_length together with action_dim
+            batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
         else:
-            batch_actions = batch["actions"][..., 0, :] # take the first one
-        batch_size, action_dim = batch_actions.shape
+            batch_actions = batch["actions"][..., 0, :]
+        batch_size, full_action_dim = batch_actions.shape
+        action_dim = self.config['action_dim']
         rng, x_rng, t_rng = jax.random.split(rng, 3)
 
-        # BC flow loss.
-        x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
+        x_0 = jax.random.normal(x_rng, (batch_size, full_action_dim))
         x_1 = batch_actions
         t = jax.random.uniform(t_rng, (batch_size, 1))
         x_t = (1 - t) * x_0 + t * x_1
@@ -95,71 +92,51 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         pred = self.network.select('actor_bc_flow')(batch['observations'], x_t, t, params=grad_params)
 
-        # --- OPTION 3: Advantage-Weighted Flow Matching ---
-        # 1. Evaluate Q-value of the actions in the batch (Q_buffer)
-        # We don't pass grad_params so no gradients flow into the critic
-        qs_buffer = self.network.select('critic')(batch['observations'], actions=batch_actions)
-        q_buffer = jnp.mean(qs_buffer, axis=0)  # (batch_size,)
-
-        # 2. Compute Top-50% Advantage Weights
-        q_buffer_no_grad = jax.lax.stop_gradient(q_buffer)
+        # Advantage computation
+        qs_1 = self.network.select('critic_1')(batch['observations'], actions=self.mask_actions(batch_actions, 1, action_dim))
+        qs_3 = self.network.select('critic_3')(batch['observations'], actions=self.mask_actions(batch_actions, 3, action_dim))
+        qs_5 = self.network.select('critic_5')(batch['observations'], actions=self.mask_actions(batch_actions, 5, action_dim))
+        
+        q_1 = jax.lax.stop_gradient(jnp.mean(qs_1, axis=0))
+        q_3 = jax.lax.stop_gradient(jnp.mean(qs_3, axis=0))
+        q_5 = jax.lax.stop_gradient(jnp.mean(qs_5, axis=0))
+        
+        gamma = self.config['discount']
+        adv_1 = (q_1 - jnp.median(q_1)) / 1.0
+        adv_3 = (q_3 - jnp.median(q_3)) / (1.0 + gamma + gamma**2)
+        adv_5 = (q_5 - jnp.median(q_5)) / (1.0 + gamma + gamma**2 + gamma**3 + gamma**4)
+        
+        best_adv = jnp.maximum(adv_1, jnp.maximum(adv_3, adv_5))
         
         if self.config.get("use_q_weighting", True):
-            # Top-50% filtering: Only actions above median Q get weight 2.0, others 0.0
-            median_q = jnp.median(q_buffer_no_grad)
-            weights = jnp.where(q_buffer_no_grad >= median_q, 2.0, 0.0)
+            median_adv = jnp.median(best_adv)
+            weights = jnp.where(best_adv >= median_adv, 2.0, 0.0)
         else:
-            # Base behavior: All actions get weight 1.0 (no Q-weighting)
-            weights = jnp.ones_like(q_buffer_no_grad)
+            weights = jnp.ones_like(best_adv)
         
-        # 4. Compute weighted MSE loss
         mse_loss = (pred - vel) ** 2
         if self.config["action_chunking"]:
             mse_loss = jnp.reshape(
                 mse_loss, 
-                (batch_size, self.config["horizon_length"], self.config["action_dim"]) 
+                (batch_size, self.config["horizon_length"], action_dim) 
             ) * batch["valid"][..., None]
             per_sample_loss = jnp.mean(mse_loss, axis=(1, 2))
         else:
             per_sample_loss = jnp.mean(mse_loss, axis=-1)
 
-        # Apply advantage weights
         bc_flow_loss = jnp.mean(per_sample_loss * weights)
-        # ---------------------------------------------------
 
-        if self.config["actor_type"] == "distill-ddpg":
-            # Distillation loss.
-            rng, noise_rng = jax.random.split(rng)
-            noises = jax.random.normal(noise_rng, (batch_size, action_dim))
-            target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
-            actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
-            distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
-            
-            # Q loss.
-            actor_actions = jnp.clip(actor_actions, -1, 1)
-
-            qs = self.network.select(f'critic')(batch['observations'], actions=actor_actions)
-            q = jnp.mean(qs, axis=0)
-            q_loss = -q.mean()
-        else:
-            distill_loss = jnp.zeros(())
-            q_loss = jnp.zeros(())
-
-        # Total loss.
-        actor_loss = bc_flow_loss + self.config['alpha'] * distill_loss + q_loss
+        actor_loss = bc_flow_loss
 
         return actor_loss, {
             'actor_loss': actor_loss,
             'bc_flow_loss': bc_flow_loss,
-            'distill_loss': distill_loss,
         }
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None):
-        """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
-
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
 
         critic_loss, critic_info = self.critic_loss(batch, grad_params, critic_rng)
@@ -174,7 +151,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         return loss, info
 
     def target_update(self, network, module_name):
-        """Update the target network."""
         new_target_params = jax.tree_util.tree_map(
             lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
             self.network.params[f'modules_{module_name}'],
@@ -184,14 +160,17 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
     @staticmethod
     def _update(agent, batch):
-        """Update the agent and return a new agent with information dictionary."""
         new_rng, rng = jax.random.split(agent.rng)
-
         def loss_fn(grad_params):
             return agent.total_loss(batch, grad_params, rng=rng)
 
         new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
-        agent.target_update(new_network, 'critic')
+        
+        # update all 3 target critics
+        agent.target_update(new_network, 'critic_1')
+        agent.target_update(new_network, 'critic_3')
+        agent.target_update(new_network, 'critic_5')
+        
         return agent.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
@@ -200,31 +179,12 @@ class ACFQLAgent(flax.struct.PyTreeNode):
     
     @jax.jit
     def batch_update(self, batch):
-        """Update the agent and return a new agent with information dictionary."""
-        # update_size = batch["observations"].shape[0]
         agent, infos = jax.lax.scan(self._update, self, batch)
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
     
     @jax.jit
-    def sample_actions(
-        self,
-        observations,
-        rng=None,
-    ):
-        
-        if self.config["actor_type"] == "distill-ddpg":
-            noises = jax.random.normal(
-                rng,
-                (
-                    *observations.shape[: -len(self.config['ob_dims'])],  # batch_size
-                    self.config['action_dim'] * \
-                        (self.config['horizon_length'] if self.config["action_chunking"] else 1),
-                ),
-            )
-            actions = self.network.select(f'actor_onestep_flow')(observations, noises)
-            actions = jnp.clip(actions, -1, 1)
-
-        elif self.config["actor_type"] == "best-of-n":
+    def sample_actions(self, observations, rng=None):
+        if self.config["actor_type"] == "best-of-n":
             action_dim = self.config['action_dim'] * \
                         (self.config['horizon_length'] if self.config["action_chunking"] else 1)
             noises = jax.random.normal(
@@ -234,34 +194,53 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                     self.config["actor_num_samples"], action_dim
                 ),
             )
-            observations = jnp.repeat(observations[..., None, :], self.config["actor_num_samples"], axis=-2)
-            actions = self.compute_flow_actions(observations, noises)
+            observations_rep = jnp.repeat(observations[..., None, :], self.config["actor_num_samples"], axis=-2)
+            actions = self.compute_flow_actions(observations_rep, noises)
             actions = jnp.clip(actions, -1, 1)
-            if self.config["q_agg"] == "mean":
-                q = self.network.select("critic")(observations, actions).mean(axis=0)
+            
+            # evaluate critics for AQC
+            batch_actions = jnp.reshape(actions, (-1, actions.shape[-1]))
+            obs_flat = jnp.reshape(observations_rep, (-1, observations.shape[-1]))
+            
+            gamma = self.config['discount']
+            
+            def get_adv(k, critic_name, norm_factor):
+                q = self.network.select(critic_name)(obs_flat, actions=self.mask_actions(batch_actions, k, self.config['action_dim']))
+                q = q.mean(axis=0) if self.config["q_agg"] == "mean" else q.min(axis=0)
+                q = q.reshape(*actions.shape[:-1]) # (batch, num_samples)
+                v = jnp.mean(q, axis=-1, keepdims=True)
+                return (q - v) / norm_factor
+                
+            adv_1 = get_adv(1, 'critic_1', 1.0)
+            adv_3 = get_adv(3, 'critic_3', 1.0 + gamma + gamma**2)
+            adv_5 = get_adv(5, 'critic_5', 1.0 + gamma + gamma**2 + gamma**3 + gamma**4)
+            
+            advs = jnp.stack([adv_1, adv_3, adv_5], axis=-1) # (batch, num_samples, 3)
+            
+            # select optimal sample and k
+            best_sample_idx = jnp.argmax(jnp.max(advs, axis=-1), axis=-1) # (batch,)
+            
+            b_indices = jnp.arange(observations.shape[0]) if len(observations.shape) > 1 else jnp.arange(1)
+            if len(observations.shape) == 1:
+                # single observation
+                best_sample = best_sample_idx.reshape(-1)[0]
+                best_k_idx = jnp.argmax(advs[0, best_sample])
+                optimal_k = jnp.array([1, 3, 5])[best_k_idx]
+                optimal_action = actions[0, best_sample]
             else:
-                q = self.network.select("critic")(observations, actions).min(axis=0)
-            indices = jnp.argmax(q, axis=-1)
+                best_k_idx = jnp.argmax(advs[b_indices, best_sample_idx], axis=-1)
+                optimal_k = jnp.array([1, 3, 5])[best_k_idx]
+                optimal_action = actions[b_indices, best_sample_idx]
+                
+            return optimal_action, optimal_k
 
-            bshape = indices.shape
-            indices = indices.reshape(-1)
-            bsize = len(indices)
-            actions = jnp.reshape(actions, (-1, self.config["actor_num_samples"], action_dim))[jnp.arange(bsize), indices, :].reshape(
-                bshape + (action_dim,))
-
-        return actions
+        return actions, jnp.array(self.config['horizon_length'])
 
     @jax.jit
-    def compute_flow_actions(
-        self,
-        observations,
-        noises,
-    ):
-        """Compute actions from the BC flow model using the Euler method."""
+    def compute_flow_actions(self, observations, noises):
         if self.config['encoder'] is not None:
             observations = self.network.select('actor_bc_flow_encoder')(observations)
         actions = noises
-        # Euler method.
         for i in range(self.config['flow_steps']):
             t = jnp.full((*observations.shape[:-1], 1), i / self.config['flow_steps'])
             vels = self.network.select('actor_bc_flow')(observations, actions, t, is_encoded=True)
@@ -270,21 +249,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         return actions
 
     @classmethod
-    def create(
-        cls,
-        seed,
-        ex_observations,
-        ex_actions,
-        config,
-    ):
-        """Create a new agent.
-
-        Args:
-            seed: Random seed.
-            ex_observations: Example batch of observations.
-            ex_actions: Example batch of actions.
-            config: Configuration dictionary.
-        """
+    def create(cls, seed, ex_observations, ex_actions, config):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
@@ -297,7 +262,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             full_actions = ex_actions
         full_action_dim = full_actions.shape[-1]
 
-        # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
@@ -305,7 +269,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             encoders['actor_bc_flow'] = encoder_module()
             encoders['actor_onestep_flow'] = encoder_module()
 
-        # Define networks.
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
@@ -321,23 +284,19 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             use_fourier_features=config["use_fourier_features"],
             fourier_feature_dim=config["fourier_feature_dim"],
         )
-        actor_onestep_flow_def = ActorVectorField(
-            hidden_dims=config['actor_hidden_dims'],
-            action_dim=full_action_dim,
-            layer_norm=config['actor_layer_norm'],
-            encoder=encoders.get('actor_onestep_flow'),
-        )
-
 
         network_info = dict(
             actor_bc_flow=(actor_bc_flow_def, (ex_observations, full_actions, ex_times)),
-            actor_onestep_flow=(actor_onestep_flow_def, (ex_observations, full_actions)),
-            critic=(critic_def, (ex_observations, full_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
+            critic_1=(critic_def, (ex_observations, full_actions)),
+            target_critic_1=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
+            critic_3=(critic_def, (ex_observations, full_actions)),
+            target_critic_3=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
+            critic_5=(critic_def, (ex_observations, full_actions)),
+            target_critic_5=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
         )
         if encoders.get('actor_bc_flow') is not None:
-            # Add actor_bc_flow_encoder to ModuleDict to make it separately callable.
             network_info['actor_bc_flow_encoder'] = (encoders.get('actor_bc_flow'), (ex_observations,))
+            
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -346,44 +305,44 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             network_tx = optax.adamw(learning_rate=config['lr'], weight_decay=config["weight_decay"])
         else:
             network_tx = optax.adam(learning_rate=config['lr'])
+            
         network_params = network_def.init(init_rng, **network_args)['params']
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
         params = network.params
-
-        params[f'modules_target_critic'] = params[f'modules_critic']
+        params[f'modules_target_critic_1'] = params[f'modules_critic_1']
+        params[f'modules_target_critic_3'] = params[f'modules_critic_3']
+        params[f'modules_target_critic_5'] = params[f'modules_critic_5']
 
         config['ob_dims'] = ob_dims
         config['action_dim'] = action_dim
 
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
-
 def get_config():
-
     config = ml_collections.ConfigDict(
         dict(
-            agent_name='acfql',  # Agent name.
-            ob_dims=ml_collections.config_dict.placeholder(list),  # Observation dimensions (will be set automatically).
-            action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
-            lr=3e-4,  # Learning rate.
-            batch_size=256,  # Batch size.
-            actor_hidden_dims=(512, 512, 512, 512),  # Actor network hidden dimensions.
-            value_hidden_dims=(512, 512, 512, 512),  # Value network hidden dimensions.
-            layer_norm=True,  # Whether to use layer normalization.
-            actor_layer_norm=False,  # Whether to use layer normalization for the actor.
-            discount=0.99,  # Discount factor.
-            tau=0.005,  # Target network update rate.
-            q_agg='mean',  # Aggregation method for target Q values.
-            alpha=100.0,  # BC coefficient (need to be tuned for each environment).
-            num_qs=2, # critic ensemble size
-            flow_steps=10,  # Number of flow steps.
-            normalize_q_loss=False,  # Whether to normalize the Q loss.
-            encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
-            horizon_length=ml_collections.config_dict.placeholder(int), # will be set
-            action_chunking=True,  # False means n-step return
-            actor_type="distill-ddpg",
-            actor_num_samples=32,  # for actor_type="best-of-n" only
+            agent_name='acfql',
+            ob_dims=ml_collections.config_dict.placeholder(list),
+            action_dim=ml_collections.config_dict.placeholder(int),
+            lr=3e-4,
+            batch_size=256,
+            actor_hidden_dims=(512, 512, 512, 512),
+            value_hidden_dims=(512, 512, 512, 512),
+            layer_norm=True,
+            actor_layer_norm=False,
+            discount=0.99,
+            tau=0.005,
+            q_agg='mean',
+            alpha=100.0,
+            num_qs=2,
+            flow_steps=10,
+            normalize_q_loss=False,
+            encoder=ml_collections.config_dict.placeholder(str),
+            horizon_length=ml_collections.config_dict.placeholder(int),
+            action_chunking=True,
+            actor_type="best-of-n",
+            actor_num_samples=32,
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,

@@ -181,7 +181,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
     
     @functools.partial(jax.jit, static_argnames=('num_samples',))
-    def sample_actions(self, observations, rng=None, num_samples=None):
+    def sample_actions(self, observations, rng=None, num_samples=None, disc_params=None, alpha_penalty=0.0):
         if num_samples is None:
             num_samples = self.config["actor_num_samples"]
             
@@ -220,6 +220,14 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                 mean_adv = jnp.mean(adv, axis=-1, keepdims=True)
                 std_adv = jnp.std(adv, axis=-1, keepdims=True)
                 z_adv = (adv - mean_adv) / (std_adv + 1e-6)
+                
+                if disc_params is not None:
+                    from models.discriminator import PerStepDiscriminator
+                    disc_model = PerStepDiscriminator()
+                    first_actions = actions[..., :self.config['action_dim']]
+                    disc_logits = disc_model.apply({'params': disc_params}, observations_rep, first_actions, deterministic=True)
+                    log_D = jax.nn.log_sigmoid(disc_logits)[..., 0]
+                    z_adv = z_adv + alpha_penalty * k * log_D
                 
                 return z_adv
                 

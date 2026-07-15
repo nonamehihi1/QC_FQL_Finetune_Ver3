@@ -161,7 +161,8 @@ def main(_):
         
         if FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0:
             eval_info, _, _ = evaluate(agent=agent, env=eval_env, action_dim=example_batch["actions"].shape[-1],
-                num_eval_episodes=FLAGS.eval_episodes, num_video_episodes=0, video_frame_skip=3)
+                num_eval_episodes=FLAGS.eval_episodes, num_video_episodes=0, video_frame_skip=3,
+                disc_params=None, alpha_penalty=FLAGS.alpha_penalty)
             logger.log(eval_info, "eval", step=log_step)
 
     # ====================== KHỞI TẠO BUFFER ======================
@@ -189,7 +190,12 @@ def main(_):
         online_rng, key = jax.random.split(online_rng)
 
         if len(action_queue) == 0:
-            actions_out, optimal_k = agent.sample_actions(observations=ob, rng=key)
+            actions_out, optimal_k = agent.sample_actions(
+                observations=ob, 
+                rng=key,
+                disc_params=disc_params if (FLAGS.use_discriminator and disc_active) else None,
+                alpha_penalty=FLAGS.alpha_penalty
+            )
             action_chunk = np.array(actions_out).reshape(-1, example_batch["actions"].shape[-1])
             # TỰ ĐỘNG CHUNKING: Chỉ lấy k hành động tối ưu!
             optimal_k_val = int(optimal_k)
@@ -273,7 +279,9 @@ def main(_):
 
         if FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0:
             eval_info, _, _ = evaluate(agent=agent, env=eval_env, action_dim=example_batch["actions"].shape[-1],
-                num_eval_episodes=FLAGS.eval_episodes, num_video_episodes=0, video_frame_skip=3)
+                num_eval_episodes=FLAGS.eval_episodes, num_video_episodes=0, video_frame_skip=3,
+                disc_params=disc_params if (FLAGS.use_discriminator and disc_active) else None,
+                alpha_penalty=FLAGS.alpha_penalty)
             logger.log(eval_info, "eval", step=log_step)
 
     print("✅ Training completed successfully!")

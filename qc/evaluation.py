@@ -45,6 +45,8 @@ def evaluate(
     action_shape=None,
     observation_shape=None,
     action_dim=None,
+    disc_params=None,
+    alpha_penalty=0.0,
 ):
     """Evaluate the agent in the environment.
 
@@ -60,7 +62,7 @@ def evaluate(
     Returns:
         A tuple containing the statistics, trajectories, and rendered videos.
     """
-    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    actor_fn = supply_rng(partial(agent.sample_actions, disc_params=disc_params, alpha_penalty=alpha_penalty), rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     trajs = []
     stats = defaultdict(list)
 
